@@ -384,7 +384,19 @@ class WebsiteScraper:
                         content = await response.read()
                         return content, content_type, 'file', status
                     else:
-                        content = await response.text()
+                        # Charset-safe decode: aiohttp's resp.text() falls back to
+                        # chardet when Content-Type lacks a charset, and chardet
+                        # frequently mis-guesses UTF-8 as Windows-1252 — producing
+                        # mojibake like `—` → `â€"`. Prefer the declared charset
+                        # unless it's one of the legacy HTTP defaults that servers
+                        # send incorrectly; otherwise force UTF-8 with replacement.
+                        raw = await response.read()
+                        declared = (response.charset or '').lower()
+                        encoding = declared if declared and declared not in ('iso-8859-1', 'windows-1252') else 'utf-8'
+                        try:
+                            content = raw.decode(encoding)
+                        except (UnicodeDecodeError, LookupError):
+                            content = raw.decode('utf-8', errors='replace')
                         return content, content_type, 'html', status
             except asyncio.TimeoutError:
                 last_error = "Timeout"
