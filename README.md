@@ -107,6 +107,40 @@ uv run python app.py https://example.com/ --concurrency 50 --timeout 60 --delay 
 | `--file`, `-f` | — | File with URLs to scrape (one per line) |
 | `--retry`, `-r` | — | File with failed URLs to retry |
 | `--fresh` | — | Ignore saved checkpoint and start fresh |
+| `--exclude-pattern` | see below | Regex to exclude URLs (repeatable; appends to defaults) |
+| `--no-default-excludes` | — | Clear built-in exclude patterns (only use `--exclude-pattern` values) |
+| `--no-strip-tracking-params` | — | Keep tracking query params (`utm_*`, `fbclid`, etc.) |
+| `--no-use-sitemap` | — | Skip sitemap.xml discovery for seed URLs |
+
+### Crawl-quality knobs
+
+Three features are **on by default** and improve crawl quality on most sites:
+
+**URL exclude patterns** — skip URLs matching common noise patterns (tag pages, author archives, pagination, print views, etc.):
+
+```bash
+# Add a custom exclude pattern (appended to defaults)
+uv run python app.py https://blog.example.com/ --exclude-pattern '/category/'
+
+# Use only your own patterns (no defaults)
+uv run python app.py https://blog.example.com/ --no-default-excludes --exclude-pattern '/archive/'
+```
+
+Default patterns: `/tag/`, `/author/`, `/feed/`, `/print/`, `?print=`, `/comments/`, `/page/\d+`, `/cdn-cgi/`.
+
+**Tracking-param stripping** — removes `utm_source`, `fbclid`, `gclid`, and similar query params so the same page isn't scraped twice with different tracking links:
+
+```bash
+# Opt out (keep all query params as-is)
+uv run python app.py https://example.com/ --no-strip-tracking-params
+```
+
+**Sitemap seeding** — fetches `sitemap.xml` (and sitemap index files) to discover pages that might not be linked from the homepage:
+
+```bash
+# Opt out
+uv run python app.py https://example.com/ --no-use-sitemap
+```
 
 ## Output structure
 
