@@ -7,7 +7,10 @@ import re
 import sqlite3
 import logging
 import json
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
+import xml.etree.ElementTree as ET
+from urllib.request import urlopen, Request
+from urllib.error import URLError
 from pathlib import Path
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
@@ -58,23 +61,172 @@ DOWNLOADABLE_MIMES = {
 }
 
 
+# Regex patterns for URLs commonly worth skipping on blog/CMS sites.
+# These are matched against the full URL (re.search). Override via
+# --exclude-pattern (repeatable) or programmatic API.
+_DEFAULT_EXCLUDE_PATTERNS: list[str] = [
+    r"/tag/",
+    r"/author/",
+    r"/feed/?$",
+    r"/print/",
+    r"\?print=",
+    r"/comments/",
+    r"/page/\d+",
+    r"/cdn-cgi/",
+]
+
+# Query-string params that are tracking only — safe to drop to prevent
+# `/page?utm_source=email` and `/page?utm_source=twitter` from being
+# stored as two different pages. Add more as you encounter them.
+_DEFAULT_TRACKING_PARAMS: frozenset[str] = frozenset({
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "gclid", "fbclid", "mc_eid", "mc_cid", "ref",
+    "_ga", "_gl", "igshid", "msclkid", "dclid",
+})
+
+
+# ---------------------------------------------------------------------------
+# Top-level helper functions
+# ---------------------------------------------------------------------------
+
+def _strip_tracking_params(url: str,
+                           tracking_params: frozenset[str] = _DEFAULT_TRACKING_PARAMS) -> str:
+    """Return *url* with tracking-only query-string keys removed.
+
+    Preserves order of non-tracking params.  Returns the URL unchanged
+    when it has no query string or all params are tracking-only (in which
+    case the ``?`` is also dropped).
+    """
+    parts = urlsplit(url)
+    if not parts.query:
+        return url
+    cleaned = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+               if k not in tracking_params]
+    new_query = urlencode(cleaned)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, ''))
+
+
+def _url_excluded(url: str, patterns: list[re.Pattern]) -> bool:
+    """True iff any compiled regex pattern matches *url*.
+
+    Empty *patterns* list means nothing is excluded (returns False).
+    """
+    for pat in patterns:
+        if pat.search(url):
+            return True
+    return False
+
+
+def _fetch_sitemap_urls(host: str, scheme: str = "https",
+                        timeout: int = 10, max_urls: int = 5000) -> list[str]:
+    """Best-effort sitemap discovery.
+
+    Tries ``{scheme}://{host}/sitemap.xml`` then
+    ``{scheme}://{host}/sitemap_index.xml``.  Recurses into
+    ``<sitemap><loc>`` entries (sitemap-index format) up to one level.
+    Returns a deduped list of ``<loc>`` URLs, capped at *max_urls*.
+    Any fetch/parse failure returns ``[]``.
+
+    Uses only stdlib (``urllib`` + ``xml.etree``) — no new deps.
+    """
+    # Common XML namespace used in sitemaps
+    ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
+    def _get(url: str) -> bytes | None:
+        try:
+            req = Request(url, headers={"User-Agent": CONFIG["user_agent"]})
+            with urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except Exception:
+            return None
+
+    def _parse_locs(xml_bytes: bytes, tag: str = "url") -> list[str]:
+        """Extract <loc> text from <url> or <sitemap> elements."""
+        urls: list[str] = []
+        try:
+            root = ET.fromstring(xml_bytes)
+        except ET.ParseError:
+            return urls
+        # Try with namespace first, then without
+        for elem in root.findall(f"sm:{tag}/sm:loc", ns):
+            if elem.text:
+                urls.append(elem.text.strip())
+        if not urls:
+            for elem in root.findall(f"{tag}/loc"):
+                if elem.text:
+                    urls.append(elem.text.strip())
+            # Also try namespace-stripped approach
+            if not urls:
+                for elem in root.iter():
+                    local = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+                    if local == "loc" and elem.text:
+                        urls.append(elem.text.strip())
+        return urls
+
+    seen: set[str] = set()
+    result: list[str] = []
+
+    for path in ("/sitemap.xml", "/sitemap_index.xml"):
+        sitemap_url = f"{scheme}://{host}{path}"
+        data = _get(sitemap_url)
+        if not data:
+            continue
+
+        # Check for sitemap index (contains <sitemap> elements)
+        sub_sitemaps = _parse_locs(data, tag="sitemap")
+        if sub_sitemaps:
+            for sub_url in sub_sitemaps:
+                sub_data = _get(sub_url)
+                if sub_data:
+                    for loc in _parse_locs(sub_data, tag="url"):
+                        if loc not in seen:
+                            seen.add(loc)
+                            result.append(loc)
+                            if len(result) >= max_urls:
+                                return result
+
+        # Also parse direct <url><loc> entries
+        for loc in _parse_locs(data, tag="url"):
+            if loc not in seen:
+                seen.add(loc)
+                result.append(loc)
+                if len(result) >= max_urls:
+                    return result
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Top-level functions for ProcessPoolExecutor (must be picklable)
 # ---------------------------------------------------------------------------
 
-def _normalize_url(url: str) -> str:
-    """Normalize URL by removing fragments and trailing slashes."""
+def _normalize_url(url: str, strip_tracking: bool = False) -> str:
+    """Normalize URL by removing fragments and trailing slashes.
+
+    When *strip_tracking* is True, also removes well-known tracking
+    query parameters (utm_*, fbclid, gclid, etc.).
+    """
     parsed = urlparse(url)
     url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
     if parsed.query:
         url += f"?{parsed.query}"
     if url.endswith('/') and parsed.path != '/':
         url = url[:-1]
+    if strip_tracking:
+        url = _strip_tracking_params(url)
     return url
 
 
-def _extract_links_lxml(html_content: str, base_url: str, base_domain: str) -> set[str]:
-    """Extract links using lxml (5-20x faster than BeautifulSoup)."""
+def _extract_links_lxml(html_content: str, base_url: str, base_domain: str,
+                        strip_tracking: bool = False,
+                        exclude_patterns: list[str] | None = None) -> set[str]:
+    """Extract links using lxml (5-20x faster than BeautifulSoup).
+
+    *exclude_patterns*: list of regex **strings** (not compiled) — we
+    compile them here because compiled patterns are not picklable across
+    the process-pool boundary.
+    """
+    compiled = [re.compile(p) for p in (exclude_patterns or [])]
     links = set()
     try:
         doc = lxml.html.fromstring(html_content)
@@ -83,14 +235,15 @@ def _extract_links_lxml(html_content: str, base_url: str, base_domain: str) -> s
         for element, attribute, link, pos in doc.iterlinks():
             if not link or not link.startswith('http'):
                 continue
-            normalized = _normalize_url(link)
+            normalized = _normalize_url(link, strip_tracking=strip_tracking)
             parsed = urlparse(normalized)
             tag = element.tag
 
             if tag == 'a':
                 # Follow all same-domain <a> links
                 if parsed.netloc == base_domain:
-                    links.add(normalized)
+                    if not _url_excluded(normalized, compiled):
+                        links.add(normalized)
             elif tag in ('link', 'script', 'img'):
                 # Only follow non-<a> tags if they point to downloadable files
                 path_lower = parsed.path.lower()
@@ -120,9 +273,13 @@ def _extract_text_trafilatura(html_content: str, url: str) -> str | None:
         return None
 
 
-def _parse_and_extract(html_content: str, url: str, base_domain: str) -> tuple[set[str], str | None]:
+def _parse_and_extract(html_content: str, url: str, base_domain: str,
+                       strip_tracking: bool = False,
+                       exclude_patterns: list[str] | None = None) -> tuple[set[str], str | None]:
     """Combined link extraction + text extraction in one process pool call."""
-    links = _extract_links_lxml(html_content, url, base_domain)
+    links = _extract_links_lxml(html_content, url, base_domain,
+                                strip_tracking=strip_tracking,
+                                exclude_patterns=exclude_patterns)
     text = _extract_text_trafilatura(html_content, url)
     return links, text
 
@@ -223,9 +380,25 @@ class URLStore:
 # ---------------------------------------------------------------------------
 
 class WebsiteScraper:
-    def __init__(self, start_url: str, fresh: bool = False):
+    def __init__(self, start_url: str, fresh: bool = False,
+                 exclude_patterns: list[str] | None = None,
+                 strip_tracking_params: bool = True,
+                 use_sitemap: bool = True):
         self.start_url = start_url
         self.base_domain = self.extract_domain(start_url)
+
+        # Crawl-quality knobs
+        self.strip_tracking_params = strip_tracking_params
+        self.use_sitemap = use_sitemap
+        # Store patterns as strings (for pickling to process pool)
+        self._exclude_pattern_strings: list[str] = (
+            exclude_patterns if exclude_patterns is not None
+            else list(_DEFAULT_EXCLUDE_PATTERNS)
+        )
+        # Pre-compile for in-process filtering (e.g. sitemap seed)
+        self._compiled_exclude_patterns: list[re.Pattern] = [
+            re.compile(p) for p in self._exclude_pattern_strings
+        ]
         self.session = None
         self.semaphore = asyncio.Semaphore(CONFIG['max_concurrent'])
         self.denied_urls: list[str] = []
@@ -297,9 +470,8 @@ class WebsiteScraper:
         parsed = urlparse(url)
         return parsed.netloc
 
-    @staticmethod
-    def normalize_url(url: str) -> str:
-        return _normalize_url(url)
+    def normalize_url(self, url: str) -> str:
+        return _normalize_url(url, strip_tracking=self.strip_tracking_params)
 
     def is_same_domain(self, url: str) -> bool:
         return self.extract_domain(url) == self.base_domain
@@ -490,7 +662,9 @@ class WebsiteScraper:
                     # Offload parsing + text extraction to process pool
                     loop = asyncio.get_running_loop()
                     links, extracted_text = await loop.run_in_executor(
-                        self.executor, _parse_and_extract, content, url, self.base_domain
+                        self.executor, _parse_and_extract, content, url,
+                        self.base_domain, self.strip_tracking_params,
+                        self._exclude_pattern_strings,
                     )
 
                     # Save HTML
@@ -535,6 +709,27 @@ class WebsiteScraper:
 
     async def crawl(self):
         await self.init_session()
+
+        # Seed from sitemap if enabled (best-effort, non-blocking)
+        if self.use_sitemap:
+            parsed_start = urlparse(self.start_url)
+            sitemap_urls = _fetch_sitemap_urls(
+                self.base_domain, scheme=parsed_start.scheme or "https",
+            )
+            if sitemap_urls:
+                added = 0
+                for surl in sitemap_urls:
+                    normalized = _normalize_url(surl, strip_tracking=self.strip_tracking_params)
+                    nparsed = urlparse(normalized)
+                    if nparsed.netloc != self.base_domain:
+                        continue
+                    if _url_excluded(normalized, self._compiled_exclude_patterns):
+                        continue
+                    if not self.url_store.contains(normalized):
+                        self.urls_to_visit.append(normalized)
+                        added += 1
+                if added:
+                    self.logger.info(f"Sitemap: seeded {added} URLs from sitemap.xml")
 
         # Start background tasks
         progress_task = asyncio.create_task(self._progress_reporter())
@@ -643,6 +838,25 @@ def parse_args():
                         help=f"Delay between requests in seconds (default: {CONFIG['delay_between_requests']})")
     parser.add_argument('--fresh', action='store_true',
                         help='Ignore any saved checkpoint and start fresh')
+    parser.add_argument('--exclude-pattern', action='append', default=None,
+                        metavar='PATTERN',
+                        help='Regex pattern to exclude URLs (repeatable; appends to defaults)')
+    parser.add_argument('--no-default-excludes', action='store_true',
+                        help='Clear the default exclude patterns (use only --exclude-pattern values)')
+    tracking_group = parser.add_mutually_exclusive_group()
+    tracking_group.add_argument('--strip-tracking-params', action='store_true', default=True,
+                                dest='strip_tracking_params',
+                                help='Strip tracking query params like utm_* (default)')
+    tracking_group.add_argument('--no-strip-tracking-params', action='store_false',
+                                dest='strip_tracking_params',
+                                help='Keep tracking query params in URLs')
+    sitemap_group = parser.add_mutually_exclusive_group()
+    sitemap_group.add_argument('--use-sitemap', action='store_true', default=True,
+                               dest='use_sitemap',
+                               help='Seed crawl queue from sitemap.xml (default)')
+    sitemap_group.add_argument('--no-use-sitemap', action='store_false',
+                               dest='use_sitemap',
+                               help='Do not fetch sitemap.xml for seed URLs')
     return parser.parse_args()
 
 
@@ -658,6 +872,14 @@ async def main():
     CONFIG['timeout'] = args.timeout
     CONFIG['delay_between_requests'] = args.delay
 
+    # Build exclude patterns list
+    if args.no_default_excludes:
+        exclude_patterns = list(args.exclude_pattern or [])
+    elif args.exclude_pattern:
+        exclude_patterns = list(_DEFAULT_EXCLUDE_PATTERNS) + args.exclude_pattern
+    else:
+        exclude_patterns = None  # use defaults inside WebsiteScraper
+
     # Group URLs by domain so each domain gets one scraper
     by_domain: dict[str, list[str]] = {}
     for url in urls:
@@ -667,7 +889,12 @@ async def main():
     # Run all domains concurrently
     async with asyncio.TaskGroup() as tg:
         for domain, domain_urls in by_domain.items():
-            scraper = WebsiteScraper(domain_urls[0], fresh=args.fresh)
+            scraper = WebsiteScraper(
+                domain_urls[0], fresh=args.fresh,
+                exclude_patterns=exclude_patterns,
+                strip_tracking_params=args.strip_tracking_params,
+                use_sitemap=args.use_sitemap,
+            )
             # Seed any additional URLs for this domain
             for extra in domain_urls[1:]:
                 normalized = scraper.normalize_url(extra)
