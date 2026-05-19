@@ -1,13 +1,14 @@
 # scrape-website
 
-Async website scraper that crawls an entire domain and downloads all pages (HTML), extracts clean text (for LLMs), and saves documents (PDF, DOCX, XLSX, etc.). Stays within the target domain — it will never follow links to external sites.
+Async website scraper that crawls an entire domain and downloads all pages (HTML), extracts clean Markdown (for LLMs/RAG knowledge bases), and saves documents (PDF, DOCX, XLSX, etc.). Stays within the target domain — it will never follow links to external sites.
 
 ## Features
 
 - **Fast async crawling** — up to 100 concurrent requests (configurable)
 - **Async DNS** — non-blocking DNS resolution with caching (via `aiodns`)
 - **Async file I/O** — non-blocking writes with `aiofiles`
-- **Clean text extraction** — extracts main content using `trafilatura` (strips nav, headers, footers, boilerplate) for LLM consumption
+- **Clean Markdown extraction** — extracts main content as Markdown using `trafilatura` (strips nav, headers, footers, boilerplate), with YAML front-matter metadata (title, url, hostname, sitename) at the top of each file
+- **Per-page deduplication** — repeated boilerplate is dropped only *within* a page; content that legitimately repeats across pages (e.g. an FAQ answer on both the FAQ page and its own page) is kept in full, so every page is a self-contained knowledge-base document
 - **Parallel HTML parsing** — `lxml` link extraction + text extraction offloaded to process pool (uses all CPU cores)
 - **SQLite-backed dedup** — exact URL deduplication with minimal RAM usage (scales to millions of URLs)
 - **Crash recovery** — auto-resumes from checkpoint on restart; use `--fresh` to start over
@@ -148,7 +149,7 @@ uv run python app.py https://example.com/ --no-use-sitemap
 data/
   example.com/
     pages/              # Raw HTML files
-    text/               # Clean extracted text (.txt) — LLM-ready
+    text/               # Clean extracted Markdown (.md) w/ metadata — LLM-ready
     files/              # Downloaded documents (PDF, DOCX, etc.)
     logs/
       scrape.log        # Full debug log
@@ -164,7 +165,9 @@ data/
 
 Each domain is stored separately, so scraping multiple sites keeps everything organized.
 
-The `text/` directory contains clean, extracted main content — ideal for feeding into LLMs, RAG pipelines, or text analysis. Navigation, headers, footers, and boilerplate are stripped by `trafilatura`.
+The `text/` directory contains clean, extracted main content as Markdown (`.md`) — ideal for feeding into LLMs, RAG pipelines, or text analysis. Navigation, headers, footers, and boilerplate are stripped by `trafilatura`. Each file opens with a YAML front-matter block (`title`, `url`, `hostname`, `sitename`) for provenance and better retrieval, followed by the page content with headings and links preserved.
+
+Deduplication is **per-page only**: `trafilatura`'s repetition cache is reset before every page, so a passage is removed only if it repeats within that same page. Text that legitimately appears on multiple pages (a shared FAQ answer, a reused policy blurb) is retained in full on every page — there is no cross-page/cross-domain content loss, which would otherwise leave some pages with a truncated file or no file at all.
 
 ## Example
 

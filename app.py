@@ -22,6 +22,7 @@ from functools import lru_cache
 
 import lxml.html
 import trafilatura
+from trafilatura.deduplication import LRU_TEST
 
 # Configuration defaults
 CONFIG = {
@@ -255,8 +256,15 @@ def _extract_links_lxml(html_content: str, base_url: str, base_domain: str,
 
 
 def _extract_text_trafilatura(html_content: str, url: str) -> str | None:
-    """Extract clean text using trafilatura — best quality for LLM consumption."""
+    """Extract clean Markdown (with metadata front matter) for LLM consumption."""
     try:
+        # Reset trafilatura's process-global dedup cache before every page so
+        # deduplication is strictly intra-page. Without this, the LRU_TEST
+        # cache accumulates across all pages handled by a long-lived
+        # ProcessPoolExecutor worker, silently stripping content that legitimately
+        # repeats across pages (e.g. an FAQ answer on both the FAQ page and its
+        # own page) — and producing no file at all when a page is only such text.
+        LRU_TEST.clear()
         text = trafilatura.extract(
             html_content,
             url=url,
@@ -265,8 +273,9 @@ def _extract_text_trafilatura(html_content: str, url: str) -> str | None:
             include_links=True,
             include_images=False,
             favor_recall=True,       # maximize content extraction
-            deduplicate=True,
-            output_format='txt',
+            deduplicate=True,        # intra-page only (cache cleared above)
+            with_metadata=True,      # YAML front matter: title, url, hostname...
+            output_format='markdown',
         )
         return text
     except Exception:
@@ -621,11 +630,11 @@ class WebsiteScraper:
     async def save_text(self, url: str, text: str):
         """Save extracted clean text for LLM consumption."""
         stem = self.generate_html_filename(url)
-        filepath = self.text_dir / f"{stem}.txt"
+        filepath = self.text_dir / f"{stem}.md"
 
         counter = 1
         while filepath.exists():
-            filepath = self.text_dir / f"{stem}_{counter}.txt"
+            filepath = self.text_dir / f"{stem}_{counter}.md"
             counter += 1
 
         async with aiofiles.open(filepath, 'w', encoding='utf-8') as f:
