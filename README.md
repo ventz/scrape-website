@@ -6,6 +6,7 @@ Async website scraper that crawls an entire domain and downloads all pages (HTML
 
 - **Fast async crawling** — up to 100 concurrent requests (configurable)
 - **JavaScript rendering (auto-escalation)** — static fetch first; when a page is detected as an un-hydrated client-rendered SPA shell (tiny text, no links), it is automatically re-fetched in headless Chromium (Playwright) and re-extracted from the hydrated DOM. Static-first by design, so only SPA pages pay the browser cost (`--render auto|never|always`)
+- **Interactive `--human` mode** — opens a **visible** browser and fetches through it, auto-pausing when it detects a Cloudflare/CAPTCHA/login challenge so you can solve it by hand; the solved session (cookies incl. `cf_clearance`) persists across pages *and across runs* via an on-disk browser profile
 - **Robust fetching** — exponential backoff with jitter, `Retry-After`-aware retries on 429/5xx, and a `curl_cffi` real-browser TLS/fingerprint fallback that retries `403`/WAF-challenge responses
 - **robots.txt politeness** — honors `robots.txt` (via `protego`) and `Crawl-Delay` (adaptive per-host rate limiting via `aiolimiter`) by default; opt out with `--ignore-robots`
 - **Document text extraction** — downloaded PDFs/Office docs are converted to RAG-ready Markdown (PyMuPDF4LLM for PDFs, MarkItDown for DOC(X)/PPT(X)/XLS(X); optional Docling fallback for complex/scanned PDFs)
@@ -122,6 +123,7 @@ uv run python app.py https://example.com/ --concurrency 50 --timeout 60 --delay 
 | `--fresh`, `-F` | — | Ignore saved checkpoint and start fresh |
 | `--fullname`, `-n` | — | Prefix output filenames with the host (`example.com_about.md`) |
 | `--render` | `auto` | JS rendering: `auto` (only SPA shells), `always` (every page), `never` (disable) |
+| `--human` | — | Open a visible browser, fetch through it, and pause for you to solve challenges/logins (forces `--concurrency 1`) |
 | `--allow-insecure-tls` | — | Disable TLS certificate verification (trusted hosts with broken certs) |
 | `--ignore-robots` | — | Do not fetch or honor `robots.txt` |
 | `--no-extract-docs` | — | Do not convert downloaded PDFs/Office docs to Markdown |
@@ -144,6 +146,23 @@ uv run python app.py https://example.com/ --render always
 # Disable rendering entirely (no browser needed)
 uv run python app.py https://example.com/ --render never
 ```
+
+### Cloudflare / CAPTCHA / login walls (`--human`)
+
+Some sites sit behind a bot challenge (Cloudflare "Just a moment…", a CAPTCHA/Turnstile/hCaptcha gate) or a login wall that a headless crawler can't get past. `--human` handles these by putting **you** in the loop:
+
+```bash
+python app.py --human "https://example.com/"
+```
+
+What it does:
+
+- Opens a **real, visible Chromium window** and fetches every page through it — so requests carry a genuine browser fingerprint (the only reliable way to reuse a solved Cloudflare `cf_clearance` cookie).
+- **Crawls normally until it hits a challenge.** When it detects a Cloudflare interstitial, CAPTCHA, or login page, it brings the window to the front and pauses with a prompt in your terminal. You solve it in the browser, press **Enter**, and the crawl continues — now carrying the cleared session.
+- **Remembers the session.** The browser profile is saved under `data/<domain>/logs/browser_profile/`, so a session you solve (or a login you complete) persists across pages and is reused on future runs — solve once, crawl for days.
+- Forces `--concurrency 1` so there's a single window and an unambiguous prompt.
+
+> Requires the Chromium binary (`uv run playwright install chromium`). This mode is slower than the static path (a browser page per URL) — reach for it only when a site actually gates you.
 
 ### Politeness & robots.txt
 
