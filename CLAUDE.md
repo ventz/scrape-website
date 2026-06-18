@@ -1,6 +1,6 @@
 # scrape-website — Project Notes
 
-Async domain scraper: crawls one domain, saves raw HTML + extracted Markdown + linked documents. Single-file app (`app.py`). Python via `uv` (deps pinned in `uv.lock`). Tiered fetch: static aiohttp first → headless Chromium (Playwright) only when a page is detected as an un-hydrated SPA shell → `curl_cffi` real-browser fingerprint fallback on 403/WAF.
+Async domain scraper: crawls one domain, saves raw HTML + extracted Markdown + linked documents. Single-file app (`app.py`). Python via `uv` (deps pinned in `uv.lock`). Tiered fetch: static aiohttp first → headless Chromium (Playwright) only when a page is detected as an un-hydrated SPA shell → `curl_cffi` real-browser fingerprint fallback on 403/WAF. `--human` swaps the fetch path to a **visible, persistent** browser for manual challenge/login solving.
 
 ## Quick Start
 
@@ -15,7 +15,7 @@ uv run python app.py https://example.com/ --render never   # disable JS renderin
 
 Output per domain: `data/<domain>/{pages/,text/,files/,logs/}`. `text/` is Markdown (`.md`) with YAML front matter, LLM/RAG-ready — holds **both** extracted page text and extracted document text.
 
-CLI short flags: `-c`/`--concurrency`, `-t`/`--timeout`, `-d`/`--delay`, `-F`/`--fresh`, `-e`/`--exclude-pattern`, `-n`/`--fullname`, plus existing `-f`/`--file`, `-r`/`--retry`. (`-f` was already `--file`, so `--fullname` is `-n`.) Other new flags: `--render {auto,never,always}`, `--allow-insecure-tls`, `--ignore-robots`, `--no-extract-docs`.
+CLI short flags: `-c`/`--concurrency`, `-t`/`--timeout`, `-d`/`--delay`, `-F`/`--fresh`, `-e`/`--exclude-pattern`, `-n`/`--fullname`, plus existing `-f`/`--file`, `-r`/`--retry`. (`-f` was already `--file`, so `--fullname` is `-n`.) Other new flags: `--render {auto,never,always}`, `--human`, `--allow-insecure-tls`, `--ignore-robots`, `--no-extract-docs`.
 
 ## Critical Constraints / Gotchas
 
@@ -38,7 +38,8 @@ CLI short flags: `-c`/`--concurrency`, `-t`/`--timeout`, `-d`/`--delay`, `-F`/`-
 - `_extract_text_trafilatura` — extraction config + per-page cache clear (the LRU gotcha above).
 - `_parse_and_extract` — lxml links + text, runs in process pool.
 - `_looks_like_spa_shell` — heuristic that triggers JS-render escalation (tiny text + SPA marker / zero links). Markers in `_SPA_SHELL_MARKERS`.
-- `_render_with_playwright` / `_ensure_browser` / `_close_browser` — lazy shared headless Chromium; blocks images/media/fonts/css, waits for network idle. `process_url` re-runs `_parse_and_extract` on the rendered HTML.
+- `_render_with_playwright` / `_ensure_browser` / `_close_browser` — lazy Chromium. `process_url` re-runs `_parse_and_extract` on the rendered HTML. **Render strategy is load-bearing** (see gotcha): block only `image`/`media`, `wait_until='domcontentloaded'` + `render_settle_ms`, NOT `networkidle`.
+- `_browser_fetch` / `_looks_challenged` / `_await_human_solve` — **`--human` mode**: `_ensure_browser` opens a headful **persistent context** (`logs/browser_profile/`); `process_url` fetches via `_browser_fetch` instead of `fetch_with_retry`; auto-pauses (blocking `input()`) when `_looks_challenged` fires (`_CHALLENGE_MARKERS`). Files fetched via `context.request.get` so they carry solved cookies.
 - `_fetch_via_curl_cffi` — 403/WAF fallback with `impersonate='chrome'`. Called inside `fetch_with_retry`.
 - `fetch_with_retry` — backoff w/ jitter (`_backoff`), `Retry-After` on `RETRYABLE_STATUS` (429/5xx).
 - `_load_robots` / `_robots_allows` — Protego robots.txt + `aiolimiter` Crawl-Delay; loaded at start of `crawl()`.
@@ -47,7 +48,12 @@ CLI short flags: `-c`/`--concurrency`, `-t`/`--timeout`, `-d`/`--delay`, `-F`/`-
 - `parse_args` — all CLI flags; `main()` threads them into `WebsiteScraper(...)`.
 
 ## Gotchas added with the tiered-fetch work
+- **Render strategy is fragile — don't "optimize" it back**: blocking CSS/fonts makes some SPAs (e.g. Next.js) throw a client-side exception and render their error boundary (`"Application error"`) instead of content → block only `image`/`media`. And `wait_until='networkidle'` **times out** on sites with chat widgets / analytics / websockets (network never idles) → use `domcontentloaded` + a fixed `render_settle_ms` hydration wait. Both were real bugs; the current settings are deliberate.
 - **Render is opt-out-able, not free**: `--render auto` (default) only escalates SPA shells; `--render never` skips the browser entirely (and avoids needing `playwright install chromium`). Don't make Playwright the default fetch path.
+- **`--human` forces `--concurrency 1`** (single visible window, one unambiguous solve prompt) and fetches everything through the browser. Session (incl. `cf_clearance`) persists on disk in `logs/browser_profile/` across runs — a manually-solved challenge or login is reused. Reason it's fetch-through-browser not cookie-handoff: `cf_clearance` is bound to the browser's TLS fingerprint, so aiohttp can't reuse it.
+- **`--fresh` clears crawl *state* (SQLite) but NOT output files** → re-runs accumulate `_1`/`_2` collision-suffixed dupes. `rm -rf data/<domain>` for a truly clean re-crawl.
+- **Queue overcounts**: `urls_to_visit` dedups against the *visited* set at enqueue/pop, not against itself, so a nav link enqueues many times and the "queued" gauge is inflated (visited count is the real coverage).
+- **SPA hosts serve HTML for `/robots.txt` and `/sitemap.xml`**: `_load_robots` skips non-`text/*`-typed robots; sitemap parse just yields 0 (link discovery + homepage render carry coverage instead).
 - **Heavy deps are lazy-imported** inside the functions that use them (`playwright`, `pymupdf4llm`, `markitdown`, `curl_cffi`, `protego`, `aiolimiter`, optional `docling`) so a `--render never` / no-docs crawl pays no import cost. Keep them lazy.
 - **`docling` is optional and NOT in `pyproject.toml`** (it pulls torch). Code falls back gracefully if absent; only used when PyMuPDF4LLM output is near-empty.
 

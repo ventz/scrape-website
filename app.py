@@ -489,7 +489,8 @@ class WebsiteScraper:
                  allow_insecure_tls: bool = False,
                  ignore_robots: bool = False,
                  fullname: bool = False,
-                 extract_docs: bool = True):
+                 extract_docs: bool = True,
+                 human: bool = False):
         self.start_url = start_url
         self.base_domain = self.extract_domain(start_url)
 
@@ -501,9 +502,13 @@ class WebsiteScraper:
         self.ignore_robots = ignore_robots
         self.fullname = fullname                  # fully-qualified output filenames
         self.extract_docs = extract_docs          # convert downloaded docs -> Markdown
+        self.human = human                        # interactive headful browser mode
 
-        # Headless-render state (lazy: Chromium only launches if a page needs it)
+        # Browser state (lazy: Chromium only launches if a page needs it).
+        # _browser: shared headless instance for SPA-render escalation.
+        # _context: persistent headful context for --human interactive mode.
         self._browser = None
+        self._context = None
         self._playwright = None
         self._browser_lock = asyncio.Lock()
         # Politeness state
@@ -698,11 +703,19 @@ class WebsiteScraper:
     # Headless rendering (lazy Chromium) — escalation tier for SPA shells
     # ------------------------------------------------------------------
     async def _ensure_browser(self):
-        """Launch a single shared headless Chromium on first use."""
-        if self._browser is not None:
+        """Launch the browser on first use.
+
+        Two modes:
+        - default: a single shared **headless** Chromium for SPA-render escalation.
+        - ``--human``: a **headful, persistent** context (visible window) whose
+          profile is stored under ``logs/browser_profile`` so a manually-solved
+          Cloudflare/CAPTCHA/login session (cookies incl. ``cf_clearance``)
+          persists across pages and across runs.
+        """
+        if self._browser is not None or self._context is not None:
             return
         async with self._browser_lock:
-            if self._browser is not None:
+            if self._browser is not None or self._context is not None:
                 return
             try:
                 from playwright.async_api import async_playwright
@@ -713,11 +726,27 @@ class WebsiteScraper:
                 )
                 return
             self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch(headless=True)
-            self.logger.debug("Headless Chromium launched for JS rendering")
+            if self.human:
+                profile_dir = self.logs_dir / 'browser_profile'
+                self._context = await self._playwright.chromium.launch_persistent_context(
+                    user_data_dir=str(profile_dir),
+                    headless=False,
+                    user_agent=CONFIG['user_agent'],
+                    viewport={'width': 1280, 'height': 900},
+                )
+                self.logger.info(
+                    "Interactive browser (--human) launched; session profile: %s",
+                    profile_dir,
+                )
+            else:
+                self._browser = await self._playwright.chromium.launch(headless=True)
+                self.logger.debug("Headless Chromium launched for JS rendering")
 
     async def _close_browser(self):
         try:
+            if self._context is not None:
+                await self._context.close()
+                self._context = None
             if self._browser is not None:
                 await self._browser.close()
                 self._browser = None
@@ -726,6 +755,96 @@ class WebsiteScraper:
                 self._playwright = None
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Interactive (--human) browser fetching: fetch through the visible
+    # persistent context, auto-pausing when a challenge/login is detected.
+    # ------------------------------------------------------------------
+    _CHALLENGE_MARKERS = (
+        'just a moment', 'checking your browser', 'cf-browser-verification',
+        'challenge-platform', 'cf_chl_', 'turnstile', 'hcaptcha', 'g-recaptcha',
+        'attention required', 'verify you are human',
+        'enable javascript and cookies to continue', 'ddos protection by',
+    )
+
+    def _looks_challenged(self, html: str, status: int) -> bool:
+        """Heuristic: is this page a bot/CAPTCHA/Cloudflare interstitial?"""
+        low = html.lower()
+        if any(m in low for m in self._CHALLENGE_MARKERS):
+            return True
+        if status in (403, 503) and 'cloudflare' in low:
+            return True
+        return False
+
+    async def _await_human_solve(self, page, url: str):
+        """Surface the window and block until the user solves the challenge.
+
+        Runs with concurrency forced to 1 (see main()), so a single blocking
+        prompt is safe and unambiguous.
+        """
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+        prompt = (
+            f"\n{'=' * 72}\n"
+            f"  CHALLENGE / LOGIN DETECTED\n"
+            f"  {url}\n"
+            f"  Solve it in the browser window (CAPTCHA / Cloudflare / sign-in),\n"
+            f"  then press <Enter> here to continue the crawl...\n"
+            f"{'=' * 72}\n"
+        )
+        self.logger.warning("Challenge detected; waiting for manual solve: %s", url)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, input, prompt)
+
+    async def _browser_fetch(self, url: str) -> tuple:
+        """Fetch *url* through the persistent (visible) browser context.
+
+        Returns the same tuple shape as fetch_with_retry. Documents are pulled
+        via the context's request API so they carry the solved session cookies;
+        HTML pages are navigated and snapshotted from the hydrated DOM.
+        """
+        await self._ensure_browser()
+        if self._context is None:
+            raise Exception("Interactive browser context unavailable")
+
+        # Binary documents: fetch bytes with the context's cookies.
+        if self.should_download_file(url):
+            resp = await self._context.request.get(
+                url, timeout=CONFIG['timeout'] * 1000)
+            ctype = resp.headers.get('content-type', '')
+            return await resp.body(), ctype, 'file', resp.status
+
+        page = await self._context.new_page()
+        try:
+            resp = await page.goto(url, wait_until='domcontentloaded',
+                                   timeout=CONFIG['render_timeout'] * 1000)
+            status = resp.status if resp else 0
+            ctype = resp.headers.get('content-type', '') if resp else 'text/html'
+            html = await page.content()
+
+            if self._looks_challenged(html, status):
+                await self._await_human_solve(page, url)
+                # Re-evaluate after the solve; the page has navigated past the
+                # interstitial and the context now holds the clearance cookie.
+                status = 200
+                await page.wait_for_timeout(CONFIG['render_settle_ms'])
+            else:
+                try:
+                    await page.wait_for_load_state(
+                        'networkidle', timeout=CONFIG['render_settle_ms'])
+                except Exception:
+                    pass
+                await page.wait_for_timeout(CONFIG['render_settle_ms'])
+
+            html = await page.content()
+            return html, ctype or 'text/html', 'html', status
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
 
     async def _render_with_playwright(self, url: str) -> str | None:
         """Render *url* in headless Chromium and return the hydrated HTML.
@@ -1021,7 +1140,13 @@ class WebsiteScraper:
                 else:
                     await asyncio.sleep(CONFIG['delay_between_requests'])
 
-                content, content_type, content_kind, status = await self.fetch_with_retry(url)
+                # --human: fetch through the visible persistent browser so a
+                # manually-solved Cloudflare/CAPTCHA/login session is reused;
+                # otherwise use the fast static aiohttp path.
+                if self.human:
+                    content, content_type, content_kind, status = await self._browser_fetch(url)
+                else:
+                    content, content_type, content_kind, status = await self.fetch_with_retry(url)
 
                 if content_kind == 'file':
                     if len(content) > CONFIG['max_file_size']:
@@ -1047,9 +1172,12 @@ class WebsiteScraper:
                     # un-hydrated SPA shell (tiny text, no links), re-fetch the
                     # page in headless Chromium and re-extract from the rendered
                     # DOM. Static-first by design — only shells pay the cost.
-                    needs_render = self.render_mode == 'always' or (
-                        self.render_mode == 'auto'
-                        and _looks_like_spa_shell(content, extracted_text, len(links))
+                    # (Skipped in --human mode: the browser already rendered it.)
+                    needs_render = not self.human and (
+                        self.render_mode == 'always' or (
+                            self.render_mode == 'auto'
+                            and _looks_like_spa_shell(content, extracted_text, len(links))
+                        )
                     )
                     if needs_render:
                         rendered = await self._render_with_playwright(url)
@@ -1109,6 +1237,11 @@ class WebsiteScraper:
 
         # Load robots.txt (and any Crawl-Delay) before fetching anything.
         await self._load_robots()
+
+        # In interactive mode, open the visible browser up front so the window
+        # is ready (and any initial challenge can be solved immediately).
+        if self.human:
+            await self._ensure_browser()
 
         # Seed from sitemap if enabled (best-effort, non-blocking)
         if self.use_sitemap:
@@ -1246,6 +1379,10 @@ def parse_args():
     parser.add_argument('--render', choices=('auto', 'never', 'always'), default='auto',
                         help="Headless-render JS pages: auto=only when a page looks like an "
                              "un-hydrated SPA shell, always=every page, never=disable (default: auto)")
+    parser.add_argument('--human', action='store_true',
+                        help="Interactive mode: open a VISIBLE browser and fetch through it; "
+                             "auto-pause for you to solve Cloudflare/CAPTCHA/login challenges "
+                             "(session persists across runs). Forces --concurrency 1.")
     parser.add_argument('--allow-insecure-tls', action='store_true',
                         help='Disable TLS certificate verification (for trusted hosts with broken certs)')
     parser.add_argument('--ignore-robots', action='store_true',
@@ -1282,6 +1419,12 @@ async def main():
         print("Error: provide a URL, --file, or --retry")
         raise SystemExit(1)
 
+    # Interactive mode drives one visible browser; force single-flight so the
+    # solve prompt is unambiguous and only one window is in play.
+    if args.human and args.concurrency != 1:
+        print("--human: forcing --concurrency 1 (interactive single window)")
+        args.concurrency = 1
+
     CONFIG['max_concurrent'] = args.concurrency
     CONFIG['timeout'] = args.timeout
     CONFIG['delay_between_requests'] = args.delay
@@ -1313,6 +1456,7 @@ async def main():
                 ignore_robots=args.ignore_robots,
                 fullname=args.fullname,
                 extract_docs=args.extract_docs,
+                human=args.human,
             )
             # Seed any additional URLs for this domain
             for extra in domain_urls[1:]:
