@@ -4,5 +4,4 @@ __pycache__/
 data/
 *.egg-info/
 .DS_Store
-uv.lock
 log.txt
