@@ -36,7 +36,8 @@ CONFIG = {
     'max_file_size': 100 * 1024 * 1024,  # 100MB max file size
     'checkpoint_interval': 30,  # Seconds between queue checkpoints
     'progress_interval': 5,  # Seconds between progress reports
-    'render_timeout': 30,  # Max seconds to wait for a headless render
+    'render_timeout': 30,  # Max seconds for the initial headless navigation
+    'render_settle_ms': 3000,  # Extra wait after DOM load for JS to hydrate
 }
 
 # HTTP status codes worth retrying (transient): rate-limit + server errors.
@@ -729,9 +730,12 @@ class WebsiteScraper:
     async def _render_with_playwright(self, url: str) -> str | None:
         """Render *url* in headless Chromium and return the hydrated HTML.
 
-        Blocks images/media/fonts/stylesheets for throughput (we only need the
-        DOM text + links), waits for network idle, and is bounded by
-        render_timeout so a hung page can't stall the crawl.
+        Only the heaviest resources (images/media) are blocked — blocking CSS
+        or fonts can make some SPAs throw a client-side exception and render
+        their error boundary instead of content. We wait for the DOM to load
+        (NOT network idle: sites with chat widgets / analytics / websockets
+        never go idle and would time out), then give the framework a short
+        fixed window to hydrate before snapshotting the DOM.
         """
         await self._ensure_browser()
         if self._browser is None:
@@ -741,14 +745,24 @@ class WebsiteScraper:
             page = await self._browser.new_page(user_agent=CONFIG['user_agent'])
 
             async def _block(route):
-                if route.request.resource_type in ('image', 'media', 'font', 'stylesheet'):
+                # Block only large media; keep CSS/fonts/scripts so client JS
+                # doesn't crash on missing resources it expects to load.
+                if route.request.resource_type in ('image', 'media'):
                     await route.abort()
                 else:
                     await route.continue_()
 
             await page.route('**/*', _block)
-            await page.goto(url, wait_until='networkidle',
+            await page.goto(url, wait_until='domcontentloaded',
                             timeout=CONFIG['render_timeout'] * 1000)
+            # Best-effort: let in-flight XHR settle, but never block on idle
+            # that may never arrive — the fixed settle below is the real wait.
+            try:
+                await page.wait_for_load_state(
+                    'networkidle', timeout=CONFIG['render_settle_ms'])
+            except Exception:
+                pass
+            await page.wait_for_timeout(CONFIG['render_settle_ms'])
             html = await page.content()
             return html
         except Exception as e:
@@ -868,10 +882,17 @@ class WebsiteScraper:
         try:
             from protego import Protego
             async with self.session.get(robots_url, allow_redirects=True) as resp:
-                if resp.status == 200:
+                ctype = resp.headers.get('Content-Type', '').lower()
+                # Some SPA/CMS hosts serve their HTML app shell (status 200) for
+                # a missing /robots.txt — don't parse that as rules.
+                if resp.status == 200 and 'html' not in ctype:
                     body = await resp.text()
                     self._robots = Protego.parse(body)
                     self.logger.info(f"robots.txt loaded from {robots_url}")
+                else:
+                    self.logger.debug(
+                        f"No usable robots.txt at {robots_url} "
+                        f"(status {resp.status}, type {ctype or 'unknown'})")
         except Exception as e:
             self.logger.debug(f"Could not load robots.txt ({robots_url}): {e}")
             self._robots = None
