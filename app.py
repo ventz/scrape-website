@@ -4,6 +4,8 @@ import aiohttp
 import aiofiles
 import os
 import re
+import ssl
+import random
 import sqlite3
 import logging
 import json
@@ -34,7 +36,21 @@ CONFIG = {
     'max_file_size': 100 * 1024 * 1024,  # 100MB max file size
     'checkpoint_interval': 30,  # Seconds between queue checkpoints
     'progress_interval': 5,  # Seconds between progress reports
+    'render_timeout': 30,  # Max seconds to wait for a headless render
 }
+
+# HTTP status codes worth retrying (transient): rate-limit + server errors.
+# 403 is handled separately via the curl_cffi impersonation fallback.
+RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+# Markers that indicate an HTML payload is a client-rendered SPA shell whose
+# real content/links only appear after JavaScript runs. Matched case-insensitively
+# against the raw HTML. Used purely as an escalation signal for headless rendering.
+_SPA_SHELL_MARKERS: tuple[str, ...] = (
+    '__next_f', '__next_data__', '__initial_state__', '__nuxt__',
+    'data-reactroot', 'ng-version', 'id="__next"', 'id="root"', 'id="app"',
+    'window.__apollo_state__',
+)
 
 # File extensions to download
 DOWNLOADABLE_EXTENSIONS = {
@@ -293,6 +309,81 @@ def _parse_and_extract(html_content: str, url: str, base_domain: str,
     return links, text
 
 
+def _looks_like_spa_shell(html_content: str, extracted_text: str | None,
+                          link_count: int, min_text: int = 200) -> bool:
+    """Heuristic: does this static HTML look like an un-hydrated SPA shell?
+
+    A client-rendered single-page app returns an near-empty document whose
+    real content and navigation only materialize once JavaScript runs, so the
+    static pass yields almost no text and almost no followable links. We
+    escalate to a headless render only when BOTH the extractable text is tiny
+    AND there's a positive signal that JS would produce more — never just
+    because a page happens to include scripts.
+    """
+    text_len = len((extracted_text or '').strip())
+    if text_len >= min_text:
+        return False
+    low = html_content.lower()
+    has_marker = any(m in low for m in _SPA_SHELL_MARKERS)
+    wants_js = 'enable javascript' in low or 'please enable js' in low
+    # A near-empty body with no same-domain links to follow is a dead end for
+    # a static crawler regardless of markers — worth one render attempt.
+    dead_end = link_count == 0
+    return has_marker or wants_js or dead_end
+
+
+def _extract_document_to_markdown(filepath: str, url: str, hostname: str) -> str | None:
+    """Convert a downloaded document (PDF / Office / text) to Markdown for RAG.
+
+    Tiered, best-effort: PyMuPDF4LLM for native PDFs, MarkItDown for Office
+    formats, and an optional Docling fallback for complex/scanned PDFs when the
+    fast path yields almost nothing (only if docling is installed). Returns the
+    Markdown body (with YAML front matter) or None on failure / empty output.
+    Runs in a worker thread — keep it import-lazy so non-document crawls pay no
+    import cost.
+    """
+    ext = os.path.splitext(filepath)[1].lower()
+    body: str | None = None
+    try:
+        if ext == '.pdf':
+            import pymupdf4llm
+            body = pymupdf4llm.to_markdown(filepath)
+            if not body or len(body.strip()) < 50:
+                # Fast path produced almost nothing (scanned / complex layout).
+                # Try Docling only if the user installed it (heavy, optional).
+                try:
+                    from docling.document_converter import DocumentConverter
+                    body = DocumentConverter().convert(filepath).document.export_to_markdown()
+                except ImportError:
+                    pass
+                except Exception:
+                    pass
+        elif ext in ('.docx', '.doc', '.pptx', '.ppt', '.xlsx', '.xls', '.odt', '.ods', '.odp', '.rtf'):
+            from markitdown import MarkItDown
+            body = MarkItDown().convert(filepath).text_content
+        elif ext in ('.txt', '.csv'):
+            with open(filepath, 'r', encoding='utf-8', errors='replace') as fh:
+                body = fh.read()
+    except Exception:
+        return None
+
+    if not body or not body.strip():
+        return None
+
+    title = os.path.basename(filepath)
+    date = datetime.now().strftime('%Y-%m-%d')
+    front_matter = (
+        "---\n"
+        f"title: {title}\n"
+        f"url: {url}\n"
+        f"hostname: {hostname}\n"
+        f"filetype: {ext.lstrip('.')}\n"
+        f"date: {date}\n"
+        "---\n\n"
+    )
+    return front_matter + body.strip() + "\n"
+
+
 # ---------------------------------------------------------------------------
 # SQLite-backed URL store
 # ---------------------------------------------------------------------------
@@ -392,13 +483,31 @@ class WebsiteScraper:
     def __init__(self, start_url: str, fresh: bool = False,
                  exclude_patterns: list[str] | None = None,
                  strip_tracking_params: bool = True,
-                 use_sitemap: bool = True):
+                 use_sitemap: bool = True,
+                 render_mode: str = 'auto',
+                 allow_insecure_tls: bool = False,
+                 ignore_robots: bool = False,
+                 fullname: bool = False,
+                 extract_docs: bool = True):
         self.start_url = start_url
         self.base_domain = self.extract_domain(start_url)
 
         # Crawl-quality knobs
         self.strip_tracking_params = strip_tracking_params
         self.use_sitemap = use_sitemap
+        self.render_mode = render_mode            # 'auto' | 'never' | 'always'
+        self.allow_insecure_tls = allow_insecure_tls
+        self.ignore_robots = ignore_robots
+        self.fullname = fullname                  # fully-qualified output filenames
+        self.extract_docs = extract_docs          # convert downloaded docs -> Markdown
+
+        # Headless-render state (lazy: Chromium only launches if a page needs it)
+        self._browser = None
+        self._playwright = None
+        self._browser_lock = asyncio.Lock()
+        # Politeness state
+        self._robots = None                       # Protego parser, loaded in crawl()
+        self._rate_limiter = None                 # aiolimiter.AsyncLimiter for Crawl-Delay
         # Store patterns as strings (for pickling to process pool)
         self._exclude_pattern_strings: list[str] = (
             exclude_patterns if exclude_patterns is not None
@@ -418,6 +527,9 @@ class WebsiteScraper:
             'pages_downloaded': 0,
             'files_downloaded': 0,
             'text_extracted': 0,
+            'docs_extracted': 0,
+            'rendered': 0,
+            'robots_skipped': 0,
             'errors': 0,
             'denied': 0,
             'total_bytes': 0,
@@ -515,6 +627,8 @@ class WebsiteScraper:
             original_name = path.split('/')[-1]
             original_name = original_name.split('?')[0]
             if original_name:
+                if self.fullname and parsed.netloc:
+                    original_name = f"{parsed.netloc}_{original_name}"
                 original_name = re.sub(r'[^\w\s\-\.]', '_', original_name)
                 return original_name
         url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
@@ -522,7 +636,13 @@ class WebsiteScraper:
         return f"file_{url_hash}{ext}"
 
     def generate_html_filename(self, url: str) -> str:
-        """Generate filename stem for HTML content (used for both .html and .txt)."""
+        """Generate filename stem for HTML content (used for both .html and .txt).
+
+        With ``--fullname``/``-n`` the stem is fully-qualified with the host
+        (e.g. ``example.com_about_team``) so text/ files stay unambiguous when
+        you aggregate corpora from several domains; default keeps the shorter
+        path-only stem.
+        """
         parsed = urlparse(url)
         path = parsed.path.strip('/')
         if not path:
@@ -531,18 +651,36 @@ class WebsiteScraper:
             filename = path.replace('/', '_')
             if filename.endswith('.html'):
                 filename = filename[:-5]
+        if self.fullname and parsed.netloc:
+            filename = f"{parsed.netloc}_{filename}"
         filename = re.sub(r'[^\w\s\-\.]', '_', filename)
         return filename
 
     async def init_session(self):
+        # TLS: strict by default. --allow-insecure-tls disables verification for
+        # the whole run (misconfigured/expired-cert sites) — logged loudly so it
+        # is never a silent downgrade.
+        ssl_param: ssl.SSLContext | bool = True
+        if self.allow_insecure_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            ssl_param = ctx
+            self.logger.warning(
+                "TLS verification DISABLED for this run (--allow-insecure-tls). "
+                "Only use this for trusted hosts with broken certificates."
+            )
         connector = aiohttp.TCPConnector(
             limit=CONFIG['max_concurrent'],
             limit_per_host=CONFIG['max_concurrent'],
             resolver=aiohttp.AsyncResolver(),
             ttl_dns_cache=300,
             enable_cleanup_closed=True,
+            ssl=ssl_param,
         )
         timeout = aiohttp.ClientTimeout(total=CONFIG['timeout'])
+        # aiohttp advertises Accept-Encoding for the codecs it can decode; with
+        # brotli + zstandard installed that includes br and zstd automatically.
         self.session = aiohttp.ClientSession(
             connector=connector,
             timeout=timeout,
@@ -553,6 +691,111 @@ class WebsiteScraper:
     async def close_session(self):
         if self.session:
             await self.session.close()
+        await self._close_browser()
+
+    # ------------------------------------------------------------------
+    # Headless rendering (lazy Chromium) — escalation tier for SPA shells
+    # ------------------------------------------------------------------
+    async def _ensure_browser(self):
+        """Launch a single shared headless Chromium on first use."""
+        if self._browser is not None:
+            return
+        async with self._browser_lock:
+            if self._browser is not None:
+                return
+            try:
+                from playwright.async_api import async_playwright
+            except ImportError:
+                self.logger.warning(
+                    "Playwright not installed; cannot render JS pages. "
+                    "Install with: uv add playwright && uv run playwright install chromium"
+                )
+                return
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(headless=True)
+            self.logger.debug("Headless Chromium launched for JS rendering")
+
+    async def _close_browser(self):
+        try:
+            if self._browser is not None:
+                await self._browser.close()
+                self._browser = None
+            if self._playwright is not None:
+                await self._playwright.stop()
+                self._playwright = None
+        except Exception:
+            pass
+
+    async def _render_with_playwright(self, url: str) -> str | None:
+        """Render *url* in headless Chromium and return the hydrated HTML.
+
+        Blocks images/media/fonts/stylesheets for throughput (we only need the
+        DOM text + links), waits for network idle, and is bounded by
+        render_timeout so a hung page can't stall the crawl.
+        """
+        await self._ensure_browser()
+        if self._browser is None:
+            return None
+        page = None
+        try:
+            page = await self._browser.new_page(user_agent=CONFIG['user_agent'])
+
+            async def _block(route):
+                if route.request.resource_type in ('image', 'media', 'font', 'stylesheet'):
+                    await route.abort()
+                else:
+                    await route.continue_()
+
+            await page.route('**/*', _block)
+            await page.goto(url, wait_until='networkidle',
+                            timeout=CONFIG['render_timeout'] * 1000)
+            html = await page.content()
+            return html
+        except Exception as e:
+            self.logger.debug(f"Render failed for {url}: {e}")
+            return None
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # curl_cffi browser-impersonation fallback (for 403 / WAF challenges)
+    # ------------------------------------------------------------------
+    async def _fetch_via_curl_cffi(self, url: str) -> tuple | None:
+        """Retry a forbidden request with a real-browser TLS/HTTP fingerprint.
+
+        aiohttp's TLS/HTTP2 fingerprint is increasingly fingerprint-blocked by
+        WAFs (Cloudflare/Akamai). curl_cffi impersonates a real Chrome so some
+        403/challenge responses resolve. Returns the same tuple shape as
+        fetch_with_retry, or None if it didn't help / isn't available.
+        """
+        try:
+            from curl_cffi.requests import AsyncSession
+        except ImportError:
+            return None
+        try:
+            async with AsyncSession() as s:
+                resp = await s.get(
+                    url, impersonate='chrome', timeout=CONFIG['timeout'],
+                    verify=not self.allow_insecure_tls, allow_redirects=True,
+                )
+                content_type = resp.headers.get('Content-Type', '')
+                status = resp.status_code
+                if status == 403 or status >= 500:
+                    return None
+                if self.should_download_file(url, content_type):
+                    return resp.content, content_type, 'file', status
+                return resp.text, content_type, 'html', status
+        except Exception as e:
+            self.logger.debug(f"curl_cffi fallback failed for {url}: {e}")
+            return None
+
+    def _backoff(self, attempt: int) -> float:
+        """Exponential backoff with full jitter (caps growth, avoids thundering herd)."""
+        return random.uniform(0, min(8.0, 1.0 * (2 ** attempt)))
 
     async def fetch_with_retry(self, url: str, method: str = 'GET') -> tuple:
         last_error = None
@@ -561,6 +804,26 @@ class WebsiteScraper:
                 async with self.session.request(method, url, allow_redirects=True) as response:
                     content_type = response.headers.get('Content-Type', '')
                     status = response.status
+
+                    # Transient server / rate-limit responses: honor Retry-After
+                    # when present, else exponential backoff, then retry.
+                    if status in RETRYABLE_STATUS and attempt < CONFIG['max_retries'] - 1:
+                        retry_after = response.headers.get('Retry-After')
+                        try:
+                            wait = float(retry_after) if retry_after else self._backoff(attempt)
+                        except ValueError:
+                            wait = self._backoff(attempt)
+                        last_error = f"HTTP {status}"
+                        await asyncio.sleep(min(wait, 30.0))
+                        continue
+
+                    # Forbidden: try a real-browser fingerprint once before giving up.
+                    if status == 403:
+                        fallback = await self._fetch_via_curl_cffi(url)
+                        if fallback is not None:
+                            self.logger.debug(f"curl_cffi fallback succeeded for {url}")
+                            return fallback
+
                     if self.should_download_file(url, content_type):
                         content = await response.read()
                         return content, content_type, 'file', status
@@ -582,12 +845,55 @@ class WebsiteScraper:
             except asyncio.TimeoutError:
                 last_error = "Timeout"
                 if attempt < CONFIG['max_retries'] - 1:
-                    await asyncio.sleep(1 * (attempt + 1))
+                    await asyncio.sleep(self._backoff(attempt))
             except Exception as e:
                 last_error = str(e)
                 if attempt < CONFIG['max_retries'] - 1:
-                    await asyncio.sleep(1 * (attempt + 1))
+                    await asyncio.sleep(self._backoff(attempt))
         raise Exception(f"Failed after {CONFIG['max_retries']} attempts: {last_error}")
+
+    # ------------------------------------------------------------------
+    # Politeness: robots.txt + adaptive per-host rate limiting
+    # ------------------------------------------------------------------
+    async def _load_robots(self):
+        """Fetch and parse robots.txt once for the crawl host (best-effort).
+
+        Also picks up Crawl-Delay and turns it into a per-host rate limiter so
+        we honor the site's requested pace without throttling extraction.
+        """
+        if self.ignore_robots:
+            return
+        parsed = urlparse(self.start_url)
+        robots_url = f"{parsed.scheme or 'https'}://{self.base_domain}/robots.txt"
+        try:
+            from protego import Protego
+            async with self.session.get(robots_url, allow_redirects=True) as resp:
+                if resp.status == 200:
+                    body = await resp.text()
+                    self._robots = Protego.parse(body)
+                    self.logger.info(f"robots.txt loaded from {robots_url}")
+        except Exception as e:
+            self.logger.debug(f"Could not load robots.txt ({robots_url}): {e}")
+            self._robots = None
+
+        if self._robots is not None:
+            try:
+                delay = self._robots.crawl_delay(CONFIG['user_agent']) \
+                    or self._robots.crawl_delay('*')
+            except Exception:
+                delay = None
+            if delay and delay > 0:
+                from aiolimiter import AsyncLimiter
+                self._rate_limiter = AsyncLimiter(1, float(delay))
+                self.logger.info(f"robots.txt Crawl-Delay: pacing to 1 request / {delay}s")
+
+    def _robots_allows(self, url: str) -> bool:
+        if self.ignore_robots or self._robots is None:
+            return True
+        try:
+            return self._robots.can_fetch(url, CONFIG['user_agent'])
+        except Exception:
+            return True
 
     async def download_file(self, url: str, content: bytes, content_type: str):
         file_hash = hashlib.md5(content).hexdigest()
@@ -611,6 +917,34 @@ class WebsiteScraper:
 
         size_mb = len(content) / (1024 * 1024)
         self.logger.debug(f"Downloaded file: {filepath.name} ({size_mb:.2f} MB)")
+
+        # Convert the document to RAG-ready Markdown alongside the raw file.
+        if self.extract_docs:
+            await self._save_document_text(filepath, url)
+
+    async def _save_document_text(self, filepath: Path, url: str):
+        """Extract a downloaded document to Markdown in text/ (off-thread)."""
+        loop = asyncio.get_running_loop()
+        try:
+            markdown = await loop.run_in_executor(
+                None, _extract_document_to_markdown,
+                str(filepath), url, self.base_domain,
+            )
+        except Exception as e:
+            self.logger.debug(f"Document extraction failed for {filepath.name}: {e}")
+            return
+        if not markdown:
+            return
+        stem = os.path.splitext(filepath.name)[0]
+        out = self.text_dir / f"{stem}.md"
+        counter = 1
+        while out.exists():
+            out = self.text_dir / f"{stem}_{counter}.md"
+            counter += 1
+        async with aiofiles.open(out, 'w', encoding='utf-8') as f:
+            await f.write(markdown)
+        self.stats['docs_extracted'] += 1
+        self.logger.debug(f"Extracted document text: {out.name}")
 
     async def save_html(self, url: str, content: str):
         stem = self.generate_html_filename(url)
@@ -652,7 +986,19 @@ class WebsiteScraper:
     async def process_url(self, url: str):
         async with self.semaphore:
             try:
-                await asyncio.sleep(CONFIG['delay_between_requests'])
+                # Politeness: respect robots.txt unless explicitly ignored.
+                if not self._robots_allows(url):
+                    self.stats['robots_skipped'] += 1
+                    self.logger.debug(f"robots.txt disallows, skipping: {url}")
+                    return
+
+                # Honor Crawl-Delay (per-host) if robots.txt declared one,
+                # else fall back to the flat politeness delay.
+                if self._rate_limiter is not None:
+                    async with self._rate_limiter:
+                        pass
+                else:
+                    await asyncio.sleep(CONFIG['delay_between_requests'])
 
                 content, content_type, content_kind, status = await self.fetch_with_retry(url)
 
@@ -675,6 +1021,25 @@ class WebsiteScraper:
                         self.base_domain, self.strip_tracking_params,
                         self._exclude_pattern_strings,
                     )
+
+                    # JS-render escalation tier: when the static pass yields an
+                    # un-hydrated SPA shell (tiny text, no links), re-fetch the
+                    # page in headless Chromium and re-extract from the rendered
+                    # DOM. Static-first by design — only shells pay the cost.
+                    needs_render = self.render_mode == 'always' or (
+                        self.render_mode == 'auto'
+                        and _looks_like_spa_shell(content, extracted_text, len(links))
+                    )
+                    if needs_render:
+                        rendered = await self._render_with_playwright(url)
+                        if rendered:
+                            content = rendered
+                            self.stats['rendered'] += 1
+                            links, extracted_text = await loop.run_in_executor(
+                                self.executor, _parse_and_extract, content, url,
+                                self.base_domain, self.strip_tracking_params,
+                                self._exclude_pattern_strings,
+                            )
 
                     # Save HTML
                     await self.save_html(url, content)
@@ -701,7 +1066,9 @@ class WebsiteScraper:
                 f"Progress: {self.url_store.count} visited | "
                 f"{self.stats['pages_downloaded']} pages | "
                 f"{self.stats['text_extracted']} text | "
+                f"{self.stats['rendered']} rendered | "
                 f"{self.stats['files_downloaded']} files | "
+                f"{self.stats['docs_extracted']} docs | "
                 f"{self.stats['denied']} denied | "
                 f"{self.stats['errors']} errors | "
                 f"{self.stats['total_bytes'] / (1024*1024):.1f} MB | "
@@ -718,6 +1085,9 @@ class WebsiteScraper:
 
     async def crawl(self):
         await self.init_session()
+
+        # Load robots.txt (and any Crawl-Delay) before fetching anything.
+        await self._load_robots()
 
         # Seed from sitemap if enabled (best-effort, non-blocking)
         if self.use_sitemap:
@@ -797,8 +1167,11 @@ class WebsiteScraper:
         self.logger.info(f"URLs visited: {self.url_store.count}")
         self.logger.info(f"Pages downloaded: {self.stats['pages_downloaded']}")
         self.logger.info(f"Text extracted: {self.stats['text_extracted']}")
+        self.logger.info(f"Pages rendered (JS): {self.stats['rendered']}")
         self.logger.info(f"Files downloaded: {self.stats['files_downloaded']}")
+        self.logger.info(f"Documents extracted: {self.stats['docs_extracted']}")
         self.logger.info(f"Access denied: {self.stats['denied']}")
+        self.logger.info(f"Skipped (robots.txt): {self.stats['robots_skipped']}")
         self.logger.info(f"Total data: {self.stats['total_bytes'] / (1024*1024):.2f} MB")
         self.logger.info(f"Errors: {self.stats['errors']}")
         self.logger.info(f"Output location: {self.base_dir}")
@@ -839,15 +1212,26 @@ def parse_args():
     parser.add_argument('url', nargs='?', help='Starting URL to scrape (e.g. https://example.com/)')
     parser.add_argument('--file', '-f', help='File with URLs to scrape (one per line)')
     parser.add_argument('--retry', '-r', help='File with failed URLs to retry (e.g. data/example.com/logs/failed_urls.txt)')
-    parser.add_argument('--concurrency', type=int, default=CONFIG['max_concurrent'],
+    parser.add_argument('--concurrency', '-c', type=int, default=CONFIG['max_concurrent'],
                         help=f"Max concurrent requests (default: {CONFIG['max_concurrent']})")
-    parser.add_argument('--timeout', type=int, default=CONFIG['timeout'],
+    parser.add_argument('--timeout', '-t', type=int, default=CONFIG['timeout'],
                         help=f"Request timeout in seconds (default: {CONFIG['timeout']})")
-    parser.add_argument('--delay', type=float, default=CONFIG['delay_between_requests'],
+    parser.add_argument('--delay', '-d', type=float, default=CONFIG['delay_between_requests'],
                         help=f"Delay between requests in seconds (default: {CONFIG['delay_between_requests']})")
-    parser.add_argument('--fresh', action='store_true',
+    parser.add_argument('--fresh', '-F', action='store_true',
                         help='Ignore any saved checkpoint and start fresh')
-    parser.add_argument('--exclude-pattern', action='append', default=None,
+    parser.add_argument('--fullname', '-n', action='store_true',
+                        help='Prefix output filenames with the host (fully-qualified, e.g. example.com_about.md)')
+    parser.add_argument('--render', choices=('auto', 'never', 'always'), default='auto',
+                        help="Headless-render JS pages: auto=only when a page looks like an "
+                             "un-hydrated SPA shell, always=every page, never=disable (default: auto)")
+    parser.add_argument('--allow-insecure-tls', action='store_true',
+                        help='Disable TLS certificate verification (for trusted hosts with broken certs)')
+    parser.add_argument('--ignore-robots', action='store_true',
+                        help='Do not fetch or honor robots.txt (default: honor it)')
+    parser.add_argument('--no-extract-docs', dest='extract_docs', action='store_false', default=True,
+                        help='Do not convert downloaded PDFs/Office docs to Markdown')
+    parser.add_argument('--exclude-pattern', '-e', action='append', default=None,
                         metavar='PATTERN',
                         help='Regex pattern to exclude URLs (repeatable; appends to defaults)')
     parser.add_argument('--no-default-excludes', action='store_true',
@@ -903,6 +1287,11 @@ async def main():
                 exclude_patterns=exclude_patterns,
                 strip_tracking_params=args.strip_tracking_params,
                 use_sitemap=args.use_sitemap,
+                render_mode=args.render,
+                allow_insecure_tls=args.allow_insecure_tls,
+                ignore_robots=args.ignore_robots,
+                fullname=args.fullname,
+                extract_docs=args.extract_docs,
             )
             # Seed any additional URLs for this domain
             for extra in domain_urls[1:]:
