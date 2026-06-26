@@ -34,7 +34,7 @@ from trafilatura.deduplication import LRU_TEST
 # Bump on every user-visible improvement/change (see CHANGELOG.md). Surfaced via
 # `--version` and logged at the start of each crawl so a run's output is traceable
 # to the code that produced it.
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # Configuration defaults
 CONFIG = {
@@ -110,28 +110,50 @@ _CHALLENGE_MARKERS: tuple[str, ...] = (
 
 
 # ===================================================================== #
-# Cloudflare ``cf_clearance`` reuse — borrow the cookie your REAL Chrome earned
+# Browser-cookie reuse — borrow the cookies your REAL Chrome earned
 # ===================================================================== #
-# Modern Cloudflare-protected sites use **Private Access Token (PAT)** challenges
-# that an AUTOMATED browser (Playwright/Chromium) can never pass — PAT is a
-# hardware-attested token (Secure Enclave) only a genuine, OS-blessed browser can
-# mint. So instead of trying to SOLVE the challenge in automation, we REUSE the
-# ``cf_clearance`` cookie your real Chrome already holds (or that you solve once in
-# a real tab we open). ``curl_cffi`` then replays it with a Chrome TLS fingerprint
-# and the SAME User-Agent (CONFIG['user_agent']) — cf_clearance is bound to
-# domain + IP (same machine) + UA (matched), so Cloudflare accepts it.
+# Modern anti-bot walls (Cloudflare Private Access Token, Imperva/Incapsula,
+# Akamai Bot Manager, DataDome, PerimeterX, ...) issue a clearance cookie that an
+# AUTOMATED browser (Playwright/Chromium) can never legitimately earn — Cloudflare's
+# PAT is a hardware-attested token (Secure Enclave) only a genuine, OS-blessed
+# browser can mint. So instead of trying to SOLVE the challenge in automation, we
+# REUSE the cookies your real Chrome already holds (or that you solve once in a real
+# tab we open). ``curl_cffi`` then replays them with a Chrome TLS fingerprint and the
+# SAME User-Agent (CONFIG['user_agent']).
 #
-# Solve ONCE per domain: the cookie is cached for the run, so later URLs on the same
-# domain reuse it silently. Sources of the cookie, in order:
+# We reuse **all** of a domain's cookies, not just Cloudflare's ``cf_clearance`` —
+# that covers Imperva (visid_incap_*/incap_ses_*), Akamai (_abck/bm_sz), etc. with
+# one uniform mechanism, and carries any login session the real browser holds too.
+# Caveats vs. Cloudflare: (1) the replay UA must match the real Chrome that earned
+# the cookies (cf_clearance is UA-bound), and (2) Imperva/Akamai tokens are more
+# tightly bound to the browser fingerprint + IP than Cloudflare's, so replay from a
+# different TLS stack is less reliable even when the cookies are valid.
+#
+# Solve ONCE per domain: cookies are cached for the run, so later URLs on the same
+# domain reuse them silently. Sources, in order:
 #   1. SCRAPE_CF_COOKIES / IB_CF_COOKIES — a JSON or Netscape cookies file you export
 #      (most reliable; works regardless of Chrome's cookie encryption).
 #   2. The live Chrome cookie store via ``browser_cookie3`` (optional dep).
 #   3. Interactive (--human): open the URL as a tab in your real Chrome, you solve it,
-#      we poll the cookie store until ``cf_clearance`` appears.
+#      we poll the cookie store until a clearance cookie appears.
 class _CFSession:
-    """Process-wide cache of Cloudflare clearance cookies, keyed by cookie domain."""
+    """Process-wide cache of a domain's browser cookies, keyed by cookie domain.
 
-    _CF_NAMES = ('cf_clearance', '__cf_bm', '__cfwaitingroom')
+    Started life as a Cloudflare ``cf_clearance`` bridge; now reuses ALL of a
+    domain's cookies so one replay path covers Imperva, Akamai Bot Manager,
+    DataDome, PerimeterX, etc. — plus any login session — not just Cloudflare."""
+
+    # Cookie names (exact or prefix, case-insensitive) that signal a SOLVED
+    # anti-bot / WAF challenge. Used ONLY to decide "do we already have clearance?";
+    # capture and replay use ALL cookies regardless of name.
+    _CLEARANCE_MARKERS = (
+        'cf_clearance',                          # Cloudflare
+        'visid_incap_', 'incap_ses_', 'nlbi_',   # Imperva / Incapsula
+        '_abck', 'bm_sz', 'ak_bmsc', 'bm_sv',    # Akamai Bot Manager
+        'datadome',                              # DataDome
+        '_px', '_pxhd', '_pxvid',                # PerimeterX
+        'reese84',                               # F5 / Shape (Distil)
+    )
     REAL_BROWSER = os.environ.get('SCRAPE_REAL_BROWSER',
                                   os.environ.get('IB_REAL_BROWSER', 'Google Chrome'))
     SOLVE_TIMEOUT = float(os.environ.get('SCRAPE_HUMAN_SOLVE_TIMEOUT', '300'))
@@ -150,7 +172,9 @@ class _CFSession:
             self._cache.setdefault(domain.lstrip('.').lower(), {}).update(cookies)
 
     def _load_manual_once(self) -> None:
-        """Load cookies from SCRAPE_CF_COOKIES / IB_CF_COOKIES (JSON or Netscape cookies.txt)."""
+        """Load ALL cookies from SCRAPE_CF_COOKIES / IB_CF_COOKIES (JSON or Netscape
+        cookies.txt). We keep every cookie, not just Cloudflare's, so the replay also
+        carries Imperva/Akamai/etc. clearance and any login session."""
         if self._manual_loaded:
             return
         self._manual_loaded = True
@@ -165,11 +189,12 @@ class _CFSession:
             data = json.loads(raw)
             if isinstance(data, list):
                 for c in data:
-                    if c.get('name') in self._CF_NAMES:
-                        self.cache(str(c.get('domain', '')), {c['name']: c.get('value', '')})
+                    name = c.get('name')
+                    if name:
+                        self.cache(str(c.get('domain', '')), {name: c.get('value', '')})
             elif isinstance(data, dict):
                 for dom, cookies in data.items():
-                    self.cache(dom, {k: v for k, v in cookies.items() if k in self._CF_NAMES})
+                    self.cache(dom, dict(cookies))
             return
         except (json.JSONDecodeError, AttributeError, TypeError):
             pass
@@ -178,7 +203,7 @@ class _CFSession:
             if not line or line.startswith('#'):
                 continue
             parts = line.split('\t')
-            if len(parts) >= 7 and parts[5] in self._CF_NAMES:
+            if len(parts) >= 7 and parts[5]:
                 self.cache(parts[0], {parts[5]: parts[6]})
 
     # -- lookup -----------------------------------------------------------
@@ -189,8 +214,13 @@ class _CFSession:
         except Exception:
             return ''
 
+    @classmethod
+    def _is_clearance(cls, name: str) -> bool:
+        n = (name or '').lower()
+        return any(n == m or n.startswith(m) for m in cls._CLEARANCE_MARKERS)
+
     def cookie_header_for(self, url: str) -> str | None:
-        """``Cookie:`` header value for any cached cf_* cookies matching ``url``'s host."""
+        """``Cookie:`` header value for ALL cached cookies matching ``url``'s host."""
         self._load_manual_once()
         host = self._host(url)
         if not host:
@@ -203,13 +233,24 @@ class _CFSession:
         return '; '.join(parts) if parts else None
 
     def has_clearance_for(self, url: str) -> bool:
-        header = self.cookie_header_for(url)
-        return bool(header and 'cf_clearance=' in header)
+        """True if we hold a cookie that signals a solved WAF/anti-bot challenge for
+        this host (cf_clearance, or an Imperva/Akamai/DataDome/PerimeterX marker)."""
+        self._load_manual_once()
+        host = self._host(url)
+        if not host:
+            return False
+        with self._lock:
+            for dom, cookies in self._cache.items():
+                if host == dom or host.endswith('.' + dom):
+                    if any(self._is_clearance(k) for k in cookies):
+                        return True
+        return False
 
     # -- acquisition (sync; call via asyncio.to_thread) -------------------
     def _read_from_chrome(self, host: str) -> dict[str, str]:
-        """Best-effort read of cf_* cookies for ``host`` from the live Chrome cookie
-        store. Returns {} if browser_cookie3 is absent or cannot decrypt."""
+        """Best-effort read of ALL cookies for ``host`` from the live Chrome cookie
+        store into the cache. Returns the cookies read (empty if browser_cookie3 is
+        absent or cannot decrypt)."""
         try:
             import browser_cookie3  # type: ignore
         except Exception:
@@ -220,7 +261,7 @@ class _CFSession:
             return {}
         got: dict[str, str] = {}
         for c in jar:
-            if c.name in self._CF_NAMES and c.value:
+            if c.value:
                 self.cache((c.domain or host), {c.name: c.value})
                 got[c.name] = c.value
         return got
@@ -247,23 +288,25 @@ class _CFSession:
         host = self._host(url)
         if not host:
             return False
-        # The cookie may already be in your real Chrome from normal browsing.
-        if self._read_from_chrome(host).get('cf_clearance'):
-            return self.has_clearance_for(url)
+        # The clearance cookie may already be in your real Chrome from normal browsing.
+        self._read_from_chrome(host)
+        if self.has_clearance_for(url):
+            return True
         if not interactive:
             return False
         if not self._open_in_real_chrome(url):
             print(f"[cf] couldn't open {self.REAL_BROWSER}; set SCRAPE_CF_COOKIES to a "
                   f"cookies file instead.", file=sys.stderr, flush=True)
             return False
-        print(f"[cf] Opened {url} in {self.REAL_BROWSER} — solve the Cloudflare challenge "
-              f"there; reusing the cookie for all of {host}.", file=sys.stderr, flush=True)
+        print(f"[cf] Opened {url} in {self.REAL_BROWSER} — solve the challenge there; "
+              f"reusing its cookies for all of {host}.", file=sys.stderr, flush=True)
         if on_wait:
             on_wait()
         deadline = time.monotonic() + max(10.0, self.SOLVE_TIMEOUT)
         while time.monotonic() < deadline:
             time.sleep(poll)
-            if self._read_from_chrome(host).get('cf_clearance') and self.has_clearance_for(url):
+            self._read_from_chrome(host)
+            if self.has_clearance_for(url):
                 print(f"[cf] clearance obtained for {host} — continuing.",
                       file=sys.stderr, flush=True)
                 return True
@@ -1107,15 +1150,16 @@ class WebsiteScraper:
     # curl_cffi browser-impersonation fallback (for 403 / WAF challenges)
     # ------------------------------------------------------------------
     async def _curl_get(self, url: str) -> tuple | None:
-        """One curl_cffi GET impersonating Chrome, replaying any cached cf_clearance
-        cookie for this host with the MATCHED User-Agent. Returns a fetch tuple, or
-        None on transport error / missing dep. The caller decides if a 403/challenge
-        response is worth escalating to the cf-clearance bridge."""
+        """One curl_cffi GET impersonating Chrome, replaying ALL cached cookies for
+        this host (Cloudflare/Imperva/Akamai clearance + any login session) with the
+        MATCHED User-Agent. Returns a fetch tuple, or None on transport error / missing
+        dep. The caller decides if a 403/challenge response is worth escalating to the
+        cookie bridge."""
         try:
             from curl_cffi.requests import AsyncSession
         except ImportError:
             return None
-        # cf_clearance is bound to UA — send the SAME UA the cookie was minted with.
+        # cf_clearance is bound to UA — send the SAME UA the cookies were minted with.
         headers = {'User-Agent': CONFIG['user_agent']}
         cookie = CF_SESSION.cookie_header_for(url)
         if cookie:
@@ -1152,17 +1196,17 @@ class WebsiteScraper:
         """Real-browser-fingerprint fallback for 403 / WAF / Cloudflare challenges.
 
         aiohttp's TLS/HTTP2 fingerprint is increasingly fingerprint-blocked by WAFs
-        (Cloudflare/Akamai). curl_cffi impersonates a real Chrome, which clears most
-        fingerprint blocks. When a host still answers with a Cloudflare challenge,
-        escalate to the **cf-clearance bridge**: reuse the ``cf_clearance`` cookie your
-        real Chrome earned (exported file / live cookie store / a one-time solve in real
-        Chrome under --human — the only thing that can mint a Private Access Token) and
-        replay with the matched UA. Returns a fetch tuple, or None if nothing helped.
+        (Cloudflare/Akamai/Imperva). curl_cffi impersonates a real Chrome, which clears
+        most fingerprint blocks. When a host still answers with a challenge, escalate to
+        the **cookie bridge**: reuse ALL the cookies your real Chrome earned (exported
+        file / live cookie store / a one-time solve in real Chrome under --human — the
+        only thing that can mint a Cloudflare Private Access Token) and replay with the
+        matched UA. Returns a fetch tuple, or None if nothing helped.
         """
         result = await self._curl_get(url)
         if not self._curl_blocked(result):
             return result
-        # Still blocked. Try to obtain a cf_clearance cookie, then replay once.
+        # Still blocked. Try to obtain clearance cookies, then replay once.
         # Silent sources (cookies file / live Chrome) always run; opening a real
         # Chrome tab to solve interactively only happens under --human.
         if not CF_SESSION.has_clearance_for(url):
