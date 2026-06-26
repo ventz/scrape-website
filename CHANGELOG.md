@@ -5,6 +5,25 @@ All notable changes to scrape-website are recorded here. Versions follow
 is `__version__` in `app.py` (also `pyproject.toml`); `python app.py --version` prints
 it and every crawl logs it at start so output is traceable to the code that produced it.
 
+## [0.4.0]
+
+### Changed
+- **Cookie bridge now reuses ALL of a domain's cookies, not just Cloudflare's
+  `cf_clearance`.** The same reuse-the-real-Chrome-cookies mechanism now defeats
+  Imperva/Incapsula (`visid_incap_*`/`incap_ses_*`), Akamai Bot Manager
+  (`_abck`/`bm_sz`), DataDome, PerimeterX, etc. uniformly — and carries any login
+  session the real browser holds. The "do we already have clearance?" gate
+  (`has_clearance_for`) now recognizes a set of WAF clearance-cookie markers
+  (`_CLEARANCE_MARKERS`) across vendors; the interactive `--human` solve polls for any
+  of them, not only `cf_clearance`. Cookie capture (exported file, live Chrome store,
+  real-Chrome solve) and replay are no longer name-filtered.
+
+  Two honest caveats: (1) this only benefits **future** runs — a host already crawled
+  successfully won't re-fetch, so re-run that domain to pick up the broader coverage;
+  and (2) Imperva/Akamai tokens are more tightly bound to the browser fingerprint + IP
+  than Cloudflare's `cf_clearance`, so replaying them from `curl_cffi`'s TLS stack is
+  less reliable even when the cookies themselves are valid.
+
 ## [0.3.0]
 
 ### Added
