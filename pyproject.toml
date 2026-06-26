@@ -1,6 +1,6 @@
 [project]
 name = "scrape-website"
-version = "0.2.0"
+version = "0.3.0"
 description = "Async website scraper that downloads all pages and documents from a domain"
 requires-python = ">=3.13"
 dependencies = [
@@ -17,4 +17,8 @@ dependencies = [
     "brotli>=1.2.0",
     "zstandard>=0.25.0",
     "markitdown[docx,pptx,xlsx]>=0.1.6",
+    # Reads cf_clearance from the live Chrome cookie store for the cf-clearance
+    # bridge (silent path). Optional at runtime — code degrades gracefully if absent
+    # and falls back to the SCRAPE_CF_COOKIES file or a --human real-Chrome solve.
+    "browser-cookie3>=0.20.1",
 ]

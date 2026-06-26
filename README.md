@@ -164,6 +164,19 @@ What it does:
 
 > Requires the Chromium binary (`uv run playwright install chromium`). This mode is slower than the static path (a browser page per URL) — reach for it only when a site actually gates you.
 
+#### Modern Cloudflare (Private Access Token) walls — the cf-clearance bridge
+
+Some Cloudflare sites use a **Private Access Token (PAT)** challenge that **no automated browser — even the visible Playwright window above — can ever pass**. A PAT is hardware-attested (Secure Enclave); only a genuine, OS-blessed browser (your real Chrome/Safari) can mint it. For these, the scraper **reuses the `cf_clearance` cookie your real Chrome earned** and replays it with a matched Chrome TLS fingerprint + User-Agent (the cookie is bound to domain + IP + UA). Cookie sources, tried in order:
+
+1. **`SCRAPE_CF_COOKIES`** (or `IB_CF_COOKIES`) — an exported cookies file (JSON `[{"domain","name":"cf_clearance","value"}]` or Netscape `cookies.txt`). Most reliable, needs **no browser and no `--human`**:
+   ```bash
+   SCRAPE_CF_COOKIES=~/cf.json python app.py "https://protected.example/"
+   ```
+2. **Your live Chrome cookie store** via `browser_cookie3` (silent; optional dep — degrades gracefully if it can't decrypt the newest Chrome).
+3. **`--human` only** — opens the URL as a tab in your **real Chrome** (`open -a`, macOS), you solve it once, and it polls until `cf_clearance` appears. Under `--human`, this also kicks in automatically when a manual Playwright solve leaves the page *still* challenged (the PAT case).
+
+Solve **once per host** — the cookie is cached for the rest of the run. The default User-Agent is Chrome 148; keep it matched to your installed Chrome (override `SCRAPE_USER_AGENT`). Other env vars: `SCRAPE_REAL_BROWSER` (default "Google Chrome"), `SCRAPE_HUMAN_SOLVE_TIMEOUT` (default 300s).
+
 ### Politeness & robots.txt
 
 `robots.txt` is honored by default, and any `Crawl-Delay` it declares becomes an adaptive per-host rate limit. Disable with `--ignore-robots` (use responsibly):
@@ -179,7 +192,7 @@ uv run python app.py https://example.com/ --ignore-robots
 uv run python app.py https://example.com/ --allow-insecure-tls
 ```
 
-`403`/WAF-challenge responses are automatically retried once with a real-browser TLS fingerprint (`curl_cffi`) before being recorded as failures.
+`401`/`403`/WAF-challenge responses (and 200 "Just a moment…" Cloudflare interstitials) are automatically retried with a real-browser TLS fingerprint (`curl_cffi`), escalating to the [cf-clearance bridge](#modern-cloudflare-private-access-token-walls--the-cf-clearance-bridge) when a `cf_clearance` cookie is available, before being recorded as failures.
 
 ### Crawl-quality knobs
 

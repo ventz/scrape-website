@@ -1,6 +1,9 @@
 # scrape-website — Project Notes
 
-Async domain scraper: crawls one domain, saves raw HTML + extracted Markdown + linked documents. Single-file app (`app.py`). Python via `uv` (deps pinned in `uv.lock`). Tiered fetch: static aiohttp first → headless Chromium (Playwright) only when a page is detected as an un-hydrated SPA shell → `curl_cffi` real-browser fingerprint fallback on 403/WAF. `--human` swaps the fetch path to a **visible, persistent** browser for manual challenge/login solving.
+Async domain scraper: crawls one domain, saves raw HTML + extracted Markdown + linked documents. Single-file app (`app.py`). Python via `uv` (deps pinned in `uv.lock`). Tiered fetch: static aiohttp first → headless Chromium (Playwright) only when a page is detected as an un-hydrated SPA shell → `curl_cffi` real-browser fingerprint fallback on 401/403/WAF/challenge → **cf-clearance bridge** (reuse the real Chrome's `cf_clearance` cookie) for modern Cloudflare PAT walls. `--human` swaps the fetch path to a **visible, persistent** browser for manual challenge/login solving.
+
+## Versioning
+`__version__` in `app.py` (kept in lockstep with `pyproject.toml`); bump on every user-visible change and add a `CHANGELOG.md` entry. `python app.py --version` prints it and every crawl logs `scrape-website vX.Y.Z` at start (output is traceable to the code that made it). Current: **0.3.0**.
 
 ## Quick Start
 
@@ -39,13 +42,21 @@ CLI short flags: `-c`/`--concurrency`, `-t`/`--timeout`, `-d`/`--delay`, `-F`/`-
 - `_parse_and_extract` — lxml links + text, runs in process pool.
 - `_looks_like_spa_shell` — heuristic that triggers JS-render escalation (tiny text + SPA marker / zero links). Markers in `_SPA_SHELL_MARKERS`.
 - `_render_with_playwright` / `_ensure_browser` / `_close_browser` — lazy Chromium. `process_url` re-runs `_parse_and_extract` on the rendered HTML. **Render strategy is load-bearing** (see gotcha): block only `image`/`media`, `wait_until='domcontentloaded'` + `render_settle_ms`, NOT `networkidle`.
-- `_browser_fetch` / `_looks_challenged` / `_await_human_solve` — **`--human` mode**: `_ensure_browser` opens a headful **persistent context** (`logs/browser_profile/`); `process_url` fetches via `_browser_fetch` instead of `fetch_with_retry`; auto-pauses (blocking `input()`) when `_looks_challenged` fires (`_CHALLENGE_MARKERS`). Files fetched via `context.request.get` so they carry solved cookies.
-- `_fetch_via_curl_cffi` — 403/WAF fallback with `impersonate='chrome'`. Called inside `fetch_with_retry`.
+- `_browser_fetch` / `_looks_challenged` / `_await_human_solve` — **`--human` mode**: `_ensure_browser` opens a headful **persistent context** (`logs/browser_profile/`); `process_url` fetches via `_browser_fetch` instead of `fetch_with_retry`; auto-pauses (blocking `input()`) when `_looks_challenged` fires (`_CHALLENGE_MARKERS`, now a module-level constant). Files fetched via `context.request.get` so they carry solved cookies. **After a manual solve, if the page is STILL challenged it's a PAT wall** (Playwright can't mint a Private Access Token) → hands off to the cf-clearance bridge via `_fetch_via_curl_cffi`.
+- `_CFSession` / `CF_SESSION` / `_looks_challenged` (module-level) — **cf-clearance bridge** (see gotcha below). `_fetch_via_curl_cffi` calls `_curl_get` (replays any cached `cf_clearance` cookie + matched UA), and on a still-blocked result calls `CF_SESSION.obtain_clearance(url, interactive=self.human)` then replays once. `_curl_blocked` decides if a curl result is a 403/5xx/challenge non-result.
+- `_fetch_via_curl_cffi` / `_curl_get` — 401/403/WAF/challenge fallback with `impersonate='chrome'`. Called inside `fetch_with_retry` (on 401/403 AND on a 200 Cloudflare interstitial) and from `_browser_fetch`.
 - `fetch_with_retry` — backoff w/ jitter (`_backoff`), `Retry-After` on `RETRYABLE_STATUS` (429/5xx).
 - `_load_robots` / `_robots_allows` — Protego robots.txt + `aiolimiter` Crawl-Delay; loaded at start of `crawl()`.
 - `_extract_document_to_markdown` (top-level) — PDF/Office → Markdown; `_save_document_text` writes it to `text/`. Called from `download_file`.
 - `save_text` / `save_html` / `generate_html_filename` / `generate_filename` — output writers; `--fullname` host-prefixes stems.
 - `parse_args` — all CLI flags; `main()` threads them into `WebsiteScraper(...)`.
+
+## Cloudflare PAT + the cf-clearance bridge (ported from ~/git/private/proj/industry-background)
+- **Modern Cloudflare = Private Access Token (PAT) → automation can NEVER pass it.** PAT is a hardware-attested token (Secure Enclave); only a genuine, OS-blessed browser (your real Chrome/Safari) can mint it. Playwright/Chromium can't — headful or not, no matter how many times you click. So `--human`'s Playwright window solves Turnstile/login walls, but **not PAT walls** (psa.gov.ph-class).
+- **The bridge reuses the `cf_clearance` cookie your REAL Chrome earned**, then replays it via `curl_cffi` with the SAME Chrome TLS fingerprint + UA. `cf_clearance` is bound to **domain + IP + UA**, so: (1) the replay UA MUST match the real Chrome that solved it — `CONFIG['user_agent']` is Chrome **148**, bump it in lockstep with your installed Chrome (override `SCRAPE_USER_AGENT`); (2) same machine (IP) only. Solve **once per host** → cached for the run.
+- **Cookie sources, in order** (`_CFSession.obtain_clearance`): cached → `SCRAPE_CF_COOKIES`/`IB_CF_COOKIES` file (JSON `[{"domain","name":"cf_clearance","value"}]` or Netscape cookies.txt) → live Chrome cookie store via `browser_cookie3` (silent; optional dep, degrades to {}) → **`--human` only:** `open -a "Google Chrome" <url>` to solve in real Chrome, then poll the cookie store until `cf_clearance` appears (`SCRAPE_HUMAN_SOLVE_TIMEOUT`, default 300s). The file/cookie-store paths work **without** `--human`; only opening a real tab is interactive.
+- **No-browser path (most reliable, no `--human`):** export the cookie once and point `SCRAPE_CF_COOKIES` at it — curl reuses it with no browser. `SCRAPE_REAL_BROWSER` overrides the app name (default "Google Chrome"). `browser_cookie3` may fail to decrypt the newest Chrome / trigger a keychain prompt → the file path is the fallback.
+- A 200 whose body is a Cloudflare "Just a moment" interstitial (`_looks_challenged`) is treated as a **block**, not content, and escalated — never archived as a real page.
 
 ## Gotchas added with the tiered-fetch work
 - **Render strategy is fragile — don't "optimize" it back**: blocking CSS/fonts makes some SPAs (e.g. Next.js) throw a client-side exception and render their error boundary (`"Application error"`) instead of content → block only `image`/`media`. And `wait_until='networkidle'` **times out** on sites with chat widgets / analytics / websockets (network never idles) → use `domcontentloaded` + a fixed `render_settle_ms` hydration wait. Both were real bugs; the current settings are deliberate.
