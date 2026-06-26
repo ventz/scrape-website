@@ -5,10 +5,15 @@ import aiofiles
 import os
 import re
 import ssl
+import sys
+import time
 import random
 import sqlite3
 import logging
 import json
+import platform
+import subprocess
+import threading
 from urllib.parse import urlparse, urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 import xml.etree.ElementTree as ET
 from urllib.request import urlopen, Request
@@ -26,12 +31,26 @@ import lxml.html
 import trafilatura
 from trafilatura.deduplication import LRU_TEST
 
+# Bump on every user-visible improvement/change (see CHANGELOG.md). Surfaced via
+# `--version` and logged at the start of each crawl so a run's output is traceable
+# to the code that produced it.
+__version__ = "0.3.0"
+
 # Configuration defaults
 CONFIG = {
     'max_concurrent': 100,  # Number of concurrent downloads
     'timeout': 30,  # Request timeout in seconds
     'max_retries': 3,  # Max retries for failed requests
-    'user_agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+    # IMPORTANT: a Cloudflare ``cf_clearance`` cookie is bound to domain + IP + the
+    # EXACT User-Agent the real browser had when it solved the challenge. The cf-session
+    # bridge (below) reuses the cookie your genuine Chrome earned, so this UA must match
+    # your real Chrome's major version or the replayed cookie is rejected. Bump it in
+    # lockstep with your installed Chrome. Override at runtime with SCRAPE_USER_AGENT.
+    'user_agent': os.environ.get(
+        'SCRAPE_USER_AGENT',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+    ),
     'delay_between_requests': 0.1,  # Politeness delay in seconds
     'max_file_size': 100 * 1024 * 1024,  # 100MB max file size
     'checkpoint_interval': 30,  # Seconds between queue checkpoints
@@ -77,6 +96,195 @@ DOWNLOADABLE_MIMES = {
     'application/vnd.oasis.opendocument.spreadsheet',
     'application/vnd.oasis.opendocument.presentation',
 }
+
+
+# Markers that indicate an HTML payload is a Cloudflare/CAPTCHA interstitial rather
+# than real content (a "Just a moment" 200 is a block, not a page). Matched
+# case-insensitively. Shared by the interactive browser path and the cf-session bridge.
+_CHALLENGE_MARKERS: tuple[str, ...] = (
+    'just a moment', 'checking your browser', 'cf-browser-verification',
+    'challenge-platform', 'cf_chl_', 'turnstile', 'hcaptcha', 'g-recaptcha',
+    'attention required', 'verify you are human',
+    'enable javascript and cookies to continue', 'ddos protection by',
+)
+
+
+# ===================================================================== #
+# Cloudflare ``cf_clearance`` reuse — borrow the cookie your REAL Chrome earned
+# ===================================================================== #
+# Modern Cloudflare-protected sites use **Private Access Token (PAT)** challenges
+# that an AUTOMATED browser (Playwright/Chromium) can never pass — PAT is a
+# hardware-attested token (Secure Enclave) only a genuine, OS-blessed browser can
+# mint. So instead of trying to SOLVE the challenge in automation, we REUSE the
+# ``cf_clearance`` cookie your real Chrome already holds (or that you solve once in
+# a real tab we open). ``curl_cffi`` then replays it with a Chrome TLS fingerprint
+# and the SAME User-Agent (CONFIG['user_agent']) — cf_clearance is bound to
+# domain + IP (same machine) + UA (matched), so Cloudflare accepts it.
+#
+# Solve ONCE per domain: the cookie is cached for the run, so later URLs on the same
+# domain reuse it silently. Sources of the cookie, in order:
+#   1. SCRAPE_CF_COOKIES / IB_CF_COOKIES — a JSON or Netscape cookies file you export
+#      (most reliable; works regardless of Chrome's cookie encryption).
+#   2. The live Chrome cookie store via ``browser_cookie3`` (optional dep).
+#   3. Interactive (--human): open the URL as a tab in your real Chrome, you solve it,
+#      we poll the cookie store until ``cf_clearance`` appears.
+class _CFSession:
+    """Process-wide cache of Cloudflare clearance cookies, keyed by cookie domain."""
+
+    _CF_NAMES = ('cf_clearance', '__cf_bm', '__cfwaitingroom')
+    REAL_BROWSER = os.environ.get('SCRAPE_REAL_BROWSER',
+                                  os.environ.get('IB_REAL_BROWSER', 'Google Chrome'))
+    SOLVE_TIMEOUT = float(os.environ.get('SCRAPE_HUMAN_SOLVE_TIMEOUT', '300'))
+
+    def __init__(self):
+        self._cache: dict[str, dict[str, str]] = {}  # domain (no leading dot) -> {name: value}
+        self._lock = threading.Lock()
+        self._manual_loaded = False
+
+    # -- cache ------------------------------------------------------------
+    def cache(self, domain: str, cookies: dict[str, str]) -> None:
+        cookies = {k: v for k, v in cookies.items() if v}
+        if not cookies:
+            return
+        with self._lock:
+            self._cache.setdefault(domain.lstrip('.').lower(), {}).update(cookies)
+
+    def _load_manual_once(self) -> None:
+        """Load cookies from SCRAPE_CF_COOKIES / IB_CF_COOKIES (JSON or Netscape cookies.txt)."""
+        if self._manual_loaded:
+            return
+        self._manual_loaded = True
+        path = os.environ.get('SCRAPE_CF_COOKIES') or os.environ.get('IB_CF_COOKIES')
+        if not path:
+            return
+        try:
+            raw = Path(path).expanduser().read_text()
+        except OSError:
+            return
+        try:  # JSON: [{"domain","name","value"}, ...] OR {"domain": {"name": "value"}}
+            data = json.loads(raw)
+            if isinstance(data, list):
+                for c in data:
+                    if c.get('name') in self._CF_NAMES:
+                        self.cache(str(c.get('domain', '')), {c['name']: c.get('value', '')})
+            elif isinstance(data, dict):
+                for dom, cookies in data.items():
+                    self.cache(dom, {k: v for k, v in cookies.items() if k in self._CF_NAMES})
+            return
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+        # Netscape cookies.txt: domain \t flag \t path \t secure \t expiry \t name \t value
+        for line in raw.splitlines():
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split('\t')
+            if len(parts) >= 7 and parts[5] in self._CF_NAMES:
+                self.cache(parts[0], {parts[5]: parts[6]})
+
+    # -- lookup -----------------------------------------------------------
+    @staticmethod
+    def _host(url: str) -> str:
+        try:
+            return (urlparse(url).hostname or '').lower()
+        except Exception:
+            return ''
+
+    def cookie_header_for(self, url: str) -> str | None:
+        """``Cookie:`` header value for any cached cf_* cookies matching ``url``'s host."""
+        self._load_manual_once()
+        host = self._host(url)
+        if not host:
+            return None
+        parts: list[str] = []
+        with self._lock:
+            for dom, cookies in self._cache.items():
+                if host == dom or host.endswith('.' + dom):
+                    parts += [f'{k}={v}' for k, v in cookies.items()]
+        return '; '.join(parts) if parts else None
+
+    def has_clearance_for(self, url: str) -> bool:
+        header = self.cookie_header_for(url)
+        return bool(header and 'cf_clearance=' in header)
+
+    # -- acquisition (sync; call via asyncio.to_thread) -------------------
+    def _read_from_chrome(self, host: str) -> dict[str, str]:
+        """Best-effort read of cf_* cookies for ``host`` from the live Chrome cookie
+        store. Returns {} if browser_cookie3 is absent or cannot decrypt."""
+        try:
+            import browser_cookie3  # type: ignore
+        except Exception:
+            return {}
+        try:
+            jar = browser_cookie3.chrome(domain_name=host)
+        except Exception:  # locked DB / decryption failure / keychain declined
+            return {}
+        got: dict[str, str] = {}
+        for c in jar:
+            if c.name in self._CF_NAMES and c.value:
+                self.cache((c.domain or host), {c.name: c.value})
+                got[c.name] = c.value
+        return got
+
+    def _open_in_real_chrome(self, url: str) -> bool:
+        """Open ``url`` as a tab in the user's REAL Chrome (macOS ``open -a``). The
+        genuine, OS-attested browser CAN pass PAT/Turnstile — the human solves there."""
+        if platform.system() != 'Darwin':
+            return False  # `open -a` is macOS-only; elsewhere rely on SCRAPE_CF_COOKIES
+        try:
+            subprocess.run(['open', '-a', self.REAL_BROWSER, url], check=False, timeout=15)
+            return True
+        except Exception:
+            return False
+
+    def obtain_clearance(self, url: str, interactive: bool, on_wait=None,
+                         poll: float = 2.0) -> bool:
+        """Get a usable cf_clearance for ``url``'s host (cached for the run). Order:
+        already-cached -> manual file -> silent read from Chrome -> (interactive only)
+        open a real Chrome tab and poll while the human solves. Returns True on success."""
+        self._load_manual_once()
+        if self.has_clearance_for(url):
+            return True
+        host = self._host(url)
+        if not host:
+            return False
+        # The cookie may already be in your real Chrome from normal browsing.
+        if self._read_from_chrome(host).get('cf_clearance'):
+            return self.has_clearance_for(url)
+        if not interactive:
+            return False
+        if not self._open_in_real_chrome(url):
+            print(f"[cf] couldn't open {self.REAL_BROWSER}; set SCRAPE_CF_COOKIES to a "
+                  f"cookies file instead.", file=sys.stderr, flush=True)
+            return False
+        print(f"[cf] Opened {url} in {self.REAL_BROWSER} — solve the Cloudflare challenge "
+              f"there; reusing the cookie for all of {host}.", file=sys.stderr, flush=True)
+        if on_wait:
+            on_wait()
+        deadline = time.monotonic() + max(10.0, self.SOLVE_TIMEOUT)
+        while time.monotonic() < deadline:
+            time.sleep(poll)
+            if self._read_from_chrome(host).get('cf_clearance') and self.has_clearance_for(url):
+                print(f"[cf] clearance obtained for {host} — continuing.",
+                      file=sys.stderr, flush=True)
+                return True
+        print(f"[cf] no clearance for {host} within {int(self.SOLVE_TIMEOUT)}s "
+              f"(if browser_cookie3 can't read your Chrome, export cookies to "
+              f"SCRAPE_CF_COOKIES).", file=sys.stderr, flush=True)
+        return False
+
+
+# Single process-wide instance (clearance is bound to this machine's IP + UA).
+CF_SESSION = _CFSession()
+
+
+def _looks_challenged(html: str, status: int) -> bool:
+    """Is this an HTTP payload a Cloudflare/CAPTCHA interstitial rather than content?"""
+    low = (html or '').lower()
+    if any(m in low for m in _CHALLENGE_MARKERS):
+        return True
+    if status in (403, 503) and 'cloudflare' in low:
+        return True
+    return False
 
 
 # Regex patterns for URLs commonly worth skipping on blog/CMS sites.
@@ -760,21 +968,9 @@ class WebsiteScraper:
     # Interactive (--human) browser fetching: fetch through the visible
     # persistent context, auto-pausing when a challenge/login is detected.
     # ------------------------------------------------------------------
-    _CHALLENGE_MARKERS = (
-        'just a moment', 'checking your browser', 'cf-browser-verification',
-        'challenge-platform', 'cf_chl_', 'turnstile', 'hcaptcha', 'g-recaptcha',
-        'attention required', 'verify you are human',
-        'enable javascript and cookies to continue', 'ddos protection by',
-    )
-
     def _looks_challenged(self, html: str, status: int) -> bool:
         """Heuristic: is this page a bot/CAPTCHA/Cloudflare interstitial?"""
-        low = html.lower()
-        if any(m in low for m in self._CHALLENGE_MARKERS):
-            return True
-        if status in (403, 503) and 'cloudflare' in low:
-            return True
-        return False
+        return _looks_challenged(html, status)
 
     async def _await_human_solve(self, page, url: str):
         """Surface the window and block until the user solves the challenge.
@@ -830,6 +1026,19 @@ class WebsiteScraper:
                 # interstitial and the context now holds the clearance cookie.
                 status = 200
                 await page.wait_for_timeout(CONFIG['render_settle_ms'])
+                html = await page.content()
+                # Playwright/Chromium can NEVER mint a Cloudflare Private Access Token
+                # (PAT) — a hardware-attested token only your genuine OS browser can
+                # produce. If the page is STILL a challenge after the solve, this is a
+                # PAT wall: hand off to the cf-clearance bridge (open the URL in your
+                # REAL Chrome, reuse the cookie it earns, replay via curl_cffi).
+                if self._looks_challenged(html, status):
+                    self.logger.warning(
+                        "Still challenged after solve (likely a PAT wall); "
+                        "escalating to the real-Chrome cf-clearance bridge: %s", url)
+                    bridged = await self._fetch_via_curl_cffi(url)
+                    if bridged is not None:
+                        return bridged
             else:
                 try:
                     await page.wait_for_load_state(
@@ -837,8 +1046,8 @@ class WebsiteScraper:
                 except Exception:
                     pass
                 await page.wait_for_timeout(CONFIG['render_settle_ms'])
+                html = await page.content()
 
-            html = await page.content()
             return html, ctype or 'text/html', 'html', status
         finally:
             try:
@@ -897,34 +1106,72 @@ class WebsiteScraper:
     # ------------------------------------------------------------------
     # curl_cffi browser-impersonation fallback (for 403 / WAF challenges)
     # ------------------------------------------------------------------
-    async def _fetch_via_curl_cffi(self, url: str) -> tuple | None:
-        """Retry a forbidden request with a real-browser TLS/HTTP fingerprint.
-
-        aiohttp's TLS/HTTP2 fingerprint is increasingly fingerprint-blocked by
-        WAFs (Cloudflare/Akamai). curl_cffi impersonates a real Chrome so some
-        403/challenge responses resolve. Returns the same tuple shape as
-        fetch_with_retry, or None if it didn't help / isn't available.
-        """
+    async def _curl_get(self, url: str) -> tuple | None:
+        """One curl_cffi GET impersonating Chrome, replaying any cached cf_clearance
+        cookie for this host with the MATCHED User-Agent. Returns a fetch tuple, or
+        None on transport error / missing dep. The caller decides if a 403/challenge
+        response is worth escalating to the cf-clearance bridge."""
         try:
             from curl_cffi.requests import AsyncSession
         except ImportError:
             return None
+        # cf_clearance is bound to UA — send the SAME UA the cookie was minted with.
+        headers = {'User-Agent': CONFIG['user_agent']}
+        cookie = CF_SESSION.cookie_header_for(url)
+        if cookie:
+            headers['Cookie'] = cookie
         try:
             async with AsyncSession() as s:
                 resp = await s.get(
-                    url, impersonate='chrome', timeout=CONFIG['timeout'],
+                    url, impersonate='chrome', headers=headers,
+                    timeout=CONFIG['timeout'],
                     verify=not self.allow_insecure_tls, allow_redirects=True,
                 )
                 content_type = resp.headers.get('Content-Type', '')
                 status = resp.status_code
-                if status == 403 or status >= 500:
-                    return None
                 if self.should_download_file(url, content_type):
                     return resp.content, content_type, 'file', status
                 return resp.text, content_type, 'html', status
         except Exception as e:
-            self.logger.debug(f"curl_cffi fallback failed for {url}: {e}")
+            self.logger.debug(f"curl_cffi fetch failed for {url}: {e}")
             return None
+
+    @staticmethod
+    def _curl_blocked(result: tuple | None) -> bool:
+        """Did a curl_cffi result fail to yield real content (403/5xx/challenge page)?"""
+        if result is None:
+            return True
+        content, _ctype, kind, status = result
+        if status == 403 or status >= 500:
+            return True
+        if kind == 'html' and _looks_challenged(content, status):
+            return True
+        return False
+
+    async def _fetch_via_curl_cffi(self, url: str) -> tuple | None:
+        """Real-browser-fingerprint fallback for 403 / WAF / Cloudflare challenges.
+
+        aiohttp's TLS/HTTP2 fingerprint is increasingly fingerprint-blocked by WAFs
+        (Cloudflare/Akamai). curl_cffi impersonates a real Chrome, which clears most
+        fingerprint blocks. When a host still answers with a Cloudflare challenge,
+        escalate to the **cf-clearance bridge**: reuse the ``cf_clearance`` cookie your
+        real Chrome earned (exported file / live cookie store / a one-time solve in real
+        Chrome under --human — the only thing that can mint a Private Access Token) and
+        replay with the matched UA. Returns a fetch tuple, or None if nothing helped.
+        """
+        result = await self._curl_get(url)
+        if not self._curl_blocked(result):
+            return result
+        # Still blocked. Try to obtain a cf_clearance cookie, then replay once.
+        # Silent sources (cookies file / live Chrome) always run; opening a real
+        # Chrome tab to solve interactively only happens under --human.
+        if not CF_SESSION.has_clearance_for(url):
+            got = await asyncio.to_thread(CF_SESSION.obtain_clearance, url, self.human)
+            if not got:
+                return None
+            self.logger.info("cf-clearance obtained; replaying %s via curl_cffi", url)
+        replay = await self._curl_get(url)
+        return None if self._curl_blocked(replay) else replay
 
     def _backoff(self, attempt: int) -> float:
         """Exponential backoff with full jitter (caps growth, avoids thundering herd)."""
@@ -950,8 +1197,9 @@ class WebsiteScraper:
                         await asyncio.sleep(min(wait, 30.0))
                         continue
 
-                    # Forbidden: try a real-browser fingerprint once before giving up.
-                    if status == 403:
+                    # Forbidden / WAF block: try a real-browser fingerprint (and the
+                    # cf-clearance bridge) once before giving up.
+                    if status in (401, 403):
                         fallback = await self._fetch_via_curl_cffi(url)
                         if fallback is not None:
                             self.logger.debug(f"curl_cffi fallback succeeded for {url}")
@@ -974,6 +1222,14 @@ class WebsiteScraper:
                             content = raw.decode(encoding)
                         except (UnicodeDecodeError, LookupError):
                             content = raw.decode('utf-8', errors='replace')
+                        # A 200 that is really a Cloudflare "Just a moment" interstitial
+                        # must not be saved as content — escalate to curl_cffi + the
+                        # cf-clearance bridge, and only fall back to the junk if it fails.
+                        if 'html' in content_type.lower() and _looks_challenged(content, status):
+                            fallback = await self._fetch_via_curl_cffi(url)
+                            if fallback is not None:
+                                self.logger.debug(f"cleared challenge interstitial for {url}")
+                                return fallback
                         return content, content_type, 'html', status
             except asyncio.TimeoutError:
                 last_error = "Timeout"
@@ -1233,6 +1489,7 @@ class WebsiteScraper:
             self.logger.debug(f"Checkpoint saved: {len(self.urls_to_visit)} URLs in queue")
 
     async def crawl(self):
+        self.logger.info("scrape-website v%s — crawling %s", __version__, self.base_domain)
         await self.init_session()
 
         # Load robots.txt (and any Crawl-Delay) before fetching anything.
@@ -1363,6 +1620,7 @@ def collect_urls(args) -> list[str]:
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Scrape an entire website (pages + documents + clean text)')
+    parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     parser.add_argument('url', nargs='?', help='Starting URL to scrape (e.g. https://example.com/)')
     parser.add_argument('--file', '-f', help='File with URLs to scrape (one per line)')
     parser.add_argument('--retry', '-r', help='File with failed URLs to retry (e.g. data/example.com/logs/failed_urls.txt)')
