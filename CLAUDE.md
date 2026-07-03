@@ -1,9 +1,9 @@
 # scrape-website — Project Notes
 
-Async domain scraper: crawls one domain, saves raw HTML + extracted Markdown + linked documents. Single-file app (`app.py`). Python via `uv` (deps pinned in `uv.lock`). Tiered fetch: static aiohttp first → headless Chromium (Playwright) only when a page is detected as an un-hydrated SPA shell → `curl_cffi` real-browser fingerprint fallback on 401/403/WAF/challenge → **cookie bridge** (reuse **all** of the real Chrome's cookies for the domain) for modern Cloudflare PAT walls and other WAFs (Imperva/Akamai/DataDome/PerimeterX). `--human` swaps the fetch path to a **visible, persistent** browser for manual challenge/login solving.
+Async domain scraper: crawls one domain, saves raw HTML + extracted Markdown + linked documents. Since **0.5.0** the implementation is an importable package (`scrape_website/`); the repo-root `app.py` is a thin shim that re-exports every legacy name and remains the CLI entrypoint. Python via `uv` (deps pinned in `uv.lock`; heavy tiers are extras `render`/`waf`/`docs`/`human`, CLI installs `all` via the dev group). Tiered fetch: static aiohttp first → headless Chromium (Playwright) only when a page is detected as an un-hydrated SPA shell → `curl_cffi` real-browser fingerprint fallback on 401/403/WAF/challenge → **cookie bridge** (reuse **all** of the real Chrome's cookies for the domain) for modern Cloudflare PAT walls and other WAFs (Imperva/Akamai/DataDome/PerimeterX). `--human` swaps the fetch path to a **visible, persistent** browser for manual challenge/login solving.
 
 ## Versioning
-`__version__` in `app.py` (kept in lockstep with `pyproject.toml`); bump on every user-visible change and add a `CHANGELOG.md` entry. `python app.py --version` prints it and every crawl logs `scrape-website vX.Y.Z` at start (output is traceable to the code that made it). Current: **0.4.0**.
+`__version__` in `scrape_website/__init__.py` (kept in lockstep with `pyproject.toml`); bump on every user-visible change and add a `CHANGELOG.md` entry. `python app.py --version` prints it and every crawl logs `scrape-website vX.Y.Z` at start (output is traceable to the code that made it). Current: **0.5.0**.
 
 ## Quick Start
 
@@ -25,19 +25,21 @@ CLI short flags: `-c`/`--concurrency`, `-t`/`--timeout`, `-d`/`--delay`, `-F`/`-
 ### trafilatura dedup is a PROCESS-GLOBAL cache
 `trafilatura.deduplication.LRU_TEST` is a module-global LRU (`MAX_REPETITIONS=2`, `MIN_DUPLCHECK_SIZE=100`). Extraction runs in a long-lived `ProcessPoolExecutor` (`max_workers=cpu_count()`, **no `maxtasksperchild`**), so without intervention the cache accumulates across every page a worker handles → silent **cross-page** content loss (a block seen >2× anywhere gets stripped; a page that is only such a block yields **no file at all**).
 
-**Fix in place** (`_extract_text_trafilatura`, app.py ~257): call `LRU_TEST.clear()` at the start of every extraction so dedup is strictly **intra-page**. Keep `deduplicate=True`. Do not remove the clear() without understanding this.
+**Fix in place** (`scrape_website/extract.py::_extract_text_trafilatura`): call `LRU_TEST.clear()` at the start of every extraction so dedup is strictly **intra-page**. Keep `deduplicate=True`. Do not remove the clear() without understanding this.
 
 - This is correct for knowledge bases: every page must be a self-contained, independently retrievable document. Cross-document dedup is a training-corpus concern, not a RAG one.
 - Concurrency-safe: each pool worker processes one `_parse_and_extract` task at a time, so per-call clear() never races.
 
 ### Output is Markdown + metadata
-`trafilatura.extract(..., output_format='markdown', with_metadata=True)`. Files are `.md` with a `---` front-matter block (`title`, `url`, `hostname`, `sitename`, `date`). `save_text` (app.py ~621) writes `.md` (collision counter `_1`, `_2`, …). Don't revert to `txt`.
+`trafilatura.extract(..., output_format='markdown', with_metadata=True)`. Files are `.md` with a `---` front-matter block (`title`, `url`, `hostname`, `sitename`, `date`). `save_text` (`scrape_website/crawler.py`) writes `.md` (collision counter `_1`, `_2`, …). Don't revert to `txt`.
 
 ### Two unrelated "dedup" concepts
 - **URL dedup** — SQLite-backed exact-URL visited tracking (`URLStore`). Unrelated to text dedup.
 - **Text dedup** — the trafilatura LRU above.
 
-## Key Files (all in `app.py`; line numbers approximate — grep the symbol)
+## Key Files (0.5.0 package layout — grep the symbol)
+
+Module map: `config.py` (CONFIG + marker tuples + downloadable types + default excludes/tracking-params), `urls.py` (`_normalize_url`/`_strip_tracking_params`/`_url_excluded`), `sitemap.py`, `extract.py` (links/text/docs/SPA+challenge heuristics), `waf.py` (`_CFSession`/`CF_SESSION`), **`fetch.py` (`FetchEngine`/`FetchOutcome` — the reusable tiered fetcher; also consumed by scrape-website-mcp; keep its public surface stable: `start/close`, `fetch`, `render`, `fetch_page(render_mode=...)`, `load_robots`/`robots_allows`/`wait_politeness`)**, `store.py` (`URLStore`), `crawler.py` (`WebsiteScraper` — composes a FetchEngine; owns output tree/checkpoints/progress/process pool), `cli.py`. `app.py` = compatibility shim only — never add implementation there.
 - `_extract_text_trafilatura` — extraction config + per-page cache clear (the LRU gotcha above).
 - `_parse_and_extract` — lxml links + text, runs in process pool.
 - `_looks_like_spa_shell` — heuristic that triggers JS-render escalation (tiny text + SPA marker / zero links). Markers in `_SPA_SHELL_MARKERS`.
@@ -71,4 +73,4 @@ CLI short flags: `-c`/`--concurrency`, `-t`/`--timeout`, `-d`/`--delay`, `-F`/`-
 ## Conventions
 - License: MIT, copyright "Ventz Petkov".
 - Harvard repos: set `git config user.email "ventz@g.harvard.edu"` per-repo (not global).
-- No test suite; verify by exercising the top-level functions (`_extract_text_trafilatura`, `_looks_like_spa_shell`, `_render_with_playwright`, `_extract_document_to_markdown`) directly on a fetched/rendered page or a generated doc, rather than running a full live domain crawl unprompted (outward-facing load).
+- Test suite (0.5.0): `uv run pytest tests/` — 59 tests covering urls/sitemap/extract/waf/fetch-engine + an `integration`-marked end-to-end CLI crawl against a local fixture server. Never run a full live domain crawl unprompted (outward-facing load).

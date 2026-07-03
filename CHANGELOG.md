@@ -2,8 +2,35 @@
 
 All notable changes to scrape-website are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/) (MAJOR.MINOR.PATCH). The running version
-is `__version__` in `app.py` (also `pyproject.toml`); `python app.py --version` prints
-it and every crawl logs it at start so output is traceable to the code that produced it.
+is `__version__` in `scrape_website/__init__.py` (also `pyproject.toml`); `python
+app.py --version` prints it and every crawl logs it at start so output is traceable
+to the code that produced it.
+
+## [0.5.0]
+
+### Changed
+- **Restructured into an importable package (`scrape_website/`).** The single-file
+  `app.py` is now a thin compatibility shim re-exporting every legacy name (so
+  `uv run python app.py <url>` and `from app import _normalize_url` keep working
+  unchanged); the implementation lives in `scrape_website/{config,urls,sitemap,
+  extract,waf,fetch,store,crawler,cli}.py`. CLI behavior is byte-identical
+  (verified by a pre/post-refactor crawl diff of the same fixture site).
+- **New `FetchEngine` (`scrape_website/fetch.py`)** — the tiered fetcher
+  (aiohttp retry/backoff + `Retry-After` → curl_cffi WAF/403 fallback + cookie
+  bridge → headless-Chromium SPA render escalation, plus protego robots +
+  Crawl-Delay pacing) extracted from `WebsiteScraper` into a reusable class,
+  consumed by both the CLI and external projects (scrape-website-mcp). Extras:
+  per-call `render_mode` override on `fetch_page()`, response `headers` on
+  `FetchOutcome`, injectable Chromium launch args.
+- **Packaging**: hatchling build backend; heavy capability tiers moved to extras —
+  `render` (playwright), `waf` (curl-cffi/brotli/zstandard), `docs`
+  (pymupdf4llm/markitdown), `human` (browser-cookie3), `all`. The CLI's `uv sync`
+  still installs everything (dev group depends on `all`); library consumers pick
+  the tiers they ship. All tiers keep degrading gracefully when absent.
+
+### Added
+- Test suite (59 tests): urls/sitemap/extract/waf/fetch-engine units plus an
+  integration-marked end-to-end CLI crawl against a local fixture server.
 
 ## [0.4.0]
 
