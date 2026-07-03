@@ -19,7 +19,7 @@ import asyncio
 import logging
 import random
 import ssl
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 import aiohttp
@@ -54,6 +54,9 @@ class FetchOutcome:
     rendered: bool = False    # True when the content is a headless-Chromium snapshot
     via: str = 'aiohttp'      # 'aiohttp' | 'curl_cffi' | 'playwright'
     denied: bool = False      # True when the HTML response is an access-denied page
+    # Response headers (aiohttp path only; curl_cffi/playwright leave it empty).
+    # Consumers use it for ETag / Last-Modified change detection.
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 class FetchEngine:
@@ -470,7 +473,8 @@ class FetchEngine:
 
                     if should_download_file(url, content_type):
                         content = await response.read()
-                        return FetchOutcome(content, content_type, 'file', status)
+                        return FetchOutcome(content, content_type, 'file', status,
+                                            headers=dict(response.headers))
                     else:
                         # Charset-safe decode: aiohttp's resp.text() falls back to
                         # chardet when Content-Type lacks a charset, and chardet
@@ -495,7 +499,8 @@ class FetchEngine:
                                 fcontent, fctype, fkind, fstatus = fallback
                                 return FetchOutcome(fcontent, fctype, fkind, fstatus,
                                                     via='curl_cffi')
-                        return FetchOutcome(content, content_type, 'html', status)
+                        return FetchOutcome(content, content_type, 'html', status,
+                                            headers=dict(response.headers))
             except asyncio.TimeoutError:
                 last_error = "Timeout"
                 if attempt < self.max_retries - 1:
@@ -570,14 +575,16 @@ class FetchEngine:
     # ------------------------------------------------------------------
     # Full page pipeline: fetch -> extract -> SPA render escalation -> re-extract
     # ------------------------------------------------------------------
-    async def fetch_page(self, url: str, *, run_extract) -> tuple[FetchOutcome, set[str], str | None]:
+    async def fetch_page(self, url: str, *, run_extract,
+                         render_mode: str | None = None) -> tuple[FetchOutcome, set[str], str | None]:
         """Fetch *url* and (for HTML) extract links + text, escalating to a
         headless render when the static pass yields an un-hydrated SPA shell.
 
         ``run_extract(html, url)`` is an awaitable callable returning
         ``(links, text)`` — the CLI passes a ProcessPoolExecutor dispatch, the
         MCP server passes an ``asyncio.to_thread`` wrapper, so the engine stays
-        executor-agnostic.
+        executor-agnostic. ``render_mode`` overrides the engine default for
+        this one call (long-lived engines serve per-request preferences).
 
         Returns ``(outcome, links, text)``. For ``kind == 'file'`` and for
         access-denied pages (``outcome.denied``), ``links`` is empty and
@@ -605,9 +612,10 @@ class FetchEngine:
         # page in headless Chromium and re-extract from the rendered
         # DOM. Static-first by design — only shells pay the cost.
         # (Skipped in --human mode: the browser already rendered it.)
+        effective_render = render_mode if render_mode is not None else self.render_mode
         needs_render = not self.human and (
-            self.render_mode == 'always' or (
-                self.render_mode == 'auto'
+            effective_render == 'always' or (
+                effective_render == 'auto'
                 and _looks_like_spa_shell(outcome.content, extracted_text, len(links))
             )
         )
