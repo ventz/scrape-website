@@ -46,6 +46,27 @@ uv run playwright install chromium
 >
 > **Optional:** for complex/scanned PDFs you can install [Docling](https://github.com/docling-project/docling) (`uv add docling`); it's lazy-loaded as a fallback only when the fast PDF path yields almost nothing.
 
+## Use as a library
+
+Since 0.5.0 the scraper is an importable package (`scrape_website`). The tiered
+fetcher (static aiohttp → curl_cffi WAF fallback → headless-Chromium render
+escalation, with robots politeness and retry/backoff) is reusable via
+`FetchEngine`:
+
+```python
+from scrape_website import FetchEngine
+
+engine = FetchEngine(render_mode="auto")
+await engine.start()
+outcome = await engine.fetch("https://example.com/")   # FetchOutcome
+await engine.close()
+```
+
+Install with extras to pick capability tiers: `scrape-website[render,waf,docs]`
+(or `[all]`). Each tier degrades gracefully when absent. The companion
+[scrape-website-mcp](https://github.com/ventz/scrape-website-mcp) server builds
+on exactly this API. The CLI (`app.py`) is unchanged.
+
 ## Usage
 
 ### Scrape a single website
