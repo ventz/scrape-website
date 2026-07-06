@@ -6,6 +6,113 @@ is `__version__` in `scrape_website/__init__.py` (also `pyproject.toml`); `pytho
 app.py --version` prints it and every crawl logs it at start so output is traceable
 to the code that produced it.
 
+## [0.7.0]
+
+### Fixed (correctness)
+- **`--delay` is now a real rate limit.** `wait_politeness` previously did a
+  per-task `asyncio.sleep`, which at concurrency 100 throttled nothing (100
+  tasks sleeping in parallel still fire 100 requests at once). Requests are now
+  paced GLOBALLY to one per `--delay` seconds (default 0.1 → 10 req/s across
+  the whole crawl). **This makes default crawls politer and slower than before**
+  — use `--delay 0` to disable pacing entirely.
+- **A 429/5xx that survives all retries is no longer archived as content.** The
+  final error response used to fall through and be saved into `pages/`+`text/`,
+  silently poisoning the corpus; it now fails the fetch so the URL lands in
+  `failed_urls.txt` for `--retry`.
+- **`_normalize_url` no longer corrupts query strings ending in `/`**
+  (`?next=/` used to become `?next=`), and now lowercases the scheme + host
+  (case-insensitive per RFC) so casing aliases dedup.
+- **`www.` and http/https aliases collapse to one canonical URL.** Same-site
+  links, sitemap seeds, and `is_same_domain` treat `www.x.com` == `x.com` and
+  rewrite links onto the crawl's canonical scheme + host — previously www links
+  from a bare-domain start were dropped entirely, and mixed-scheme sites were
+  crawled (and saved) twice.
+
+### Fixed (scalability)
+- **Headless renders are capped** (`max_render_concurrency`, default 4) so an
+  SPA-heavy site at high crawl concurrency can't open 100 Chromium pages at
+  once and thrash itself into spurious timeouts.
+- **Oversized files are no longer buffered into memory before the size check**:
+  the cap is enforced via Content-Length up front, else via a chunked read that
+  bails the moment the cap is crossed (`FetchOutcome.detail == 'file too large'`).
+- **The crawl queue is deduplicated** (a link appearing on every page is queued
+  once, not once per page), fixing the inflated "queued" gauge and shrinking
+  the 30-second queue checkpoint accordingly.
+- **Sub-sitemaps fetch concurrently** (8 workers) instead of serially — a large
+  sitemap index no longer stalls the crawl start for minutes.
+- **The visited-URL set now lives fully in memory** (write-through to SQLite),
+  removing per-link database lookups from the crawl hot path.
+
+### Fixed (audit follow-ups: security + retry)
+- **`--retry` actually retries now.** URLs in a retry file were silently
+  rejected by the resumed visited-set guard (they were *visited* — that's how
+  they failed), so retry runs processed nothing. Retry URLs are now force-
+  requeued (`WebsiteScraper.requeue` / `URLStore.forget`).
+- **SSRF hardening** (`_is_safe_fetch_target`): URLs sourced from crawled
+  content — cross-host `<img>/<script>/<link>` document links and
+  sitemap-index children — are now restricted to http(s) and non-internal
+  hosts, so a crawled page or crafted sitemap can't point the scraper at
+  `file:///…` or cloud-metadata/link-local/private addresses. Sitemap children
+  must additionally be same-site (www-alias ok).
+- **Response-size caps everywhere**: HTML pages are read in chunks and fail at
+  `max_page_size` (default 50 MB decompressed — compression-bomb guard;
+  aiohttp transparently inflates gzip/br/zstd), curl_cffi results are
+  size-checked, and sitemaps are capped at 10 MB.
+- **Sitemap XML with a DTD is refused** (`<!DOCTYPE`/`<!ENTITY` → ignored):
+  stdlib `xml.etree` is not hardened against entity-expansion bombs and real
+  sitemaps never declare DTDs. Sitemap fetching also honors
+  `--allow-insecure-tls` and the configured timeout now.
+- **Output-path hardening**: the start URL's netloc is validated before being
+  used as the `data/<domain>` directory name (`http://../x` no longer steers
+  writes outside `data/`), and URL paths that sanitize to a dots-only stem
+  (`/..`) fall back to hash-based filenames.
+- **Cookie-safety warning**: combining `--allow-insecure-tls` with the
+  real-Chrome cookie bridge now warns loudly that a MITM could capture the
+  replayed session cookies.
+
+### Fixed (robustness)
+- **Report lists survive crash + resume**: denied/failed/not-found/challenged
+  URL lists are checkpointed to SQLite, so the post-crawl `.txt` reports stay
+  complete after a resume.
+- **Race-free file writes**: identical-content downloads use an atomic
+  check-and-claim on the content hash, and output filename collision handling
+  reserves paths without awaiting in between.
+- **`--fresh` now overwrites previous output** instead of accumulating
+  `_1`/`_2` collision-suffixed duplicates — a fresh re-crawl of a domain yields
+  deterministic filenames without `rm -rf data/<domain>` first. (Resumed,
+  non-fresh runs still suffix rather than clobber pre-existing files.)
+
+## [0.6.0]
+
+### Added
+- **Page classification (`classify_page` in `scrape_website/extract.py`)** — every
+  HTML response is now classified as `content` / `challenge` / `not_found` /
+  `denied` / `search` (with a human-readable detail such as "Cloudflare Turnstile
+  CAPTCHA" or "soft 404"), surfaced on `FetchOutcome.classification`/`.detail`.
+  Consequences:
+  - **`--human` only pauses for genuine challenges.** A 404, plain 403, or
+    search-results page no longer triggers the "press Enter to continue" solve
+    prompt, and the prompt now names what was detected (Turnstile vs hCaptcha vs
+    reCAPTCHA vs Cloudflare interstitial).
+  - **404/410 and soft-404 pages are no longer archived as content** — they are
+    counted (`404s` in the progress line, `Not found` in the final summary) and
+    written to `logs/not_found.txt`.
+  - **Challenge pages that no escalation tier could clear** are counted separately,
+    logged at INFO with the vendor detail, and written to
+    `logs/challenged_urls.txt` with a retry hint (`--human` / `SCRAPE_CF_COOKIES`).
+- **`-v`/`--verbose`** — console shows every per-URL event (fetches, saves,
+  fallbacks, errors). Default console keeps milestones + the 5-second progress
+  line; full detail continues to go to `logs/scrape.log` either way.
+
+### Changed
+- **The console now narrates the slow paths** so a crawl never looks hung:
+  sitemap discovery (now also off the event loop in an executor), retry/backoff
+  waits with the wait time, 401/403 → curl_cffi fallback escalation,
+  challenge-interstitial escalation, the real-Chrome cookie-bridge attempt,
+  SPA-shell headless-render escalation, and the browser_cookie3 cookie-store
+  read (which can block on a macOS Keychain prompt). Startup logs the active
+  mode (render/human/robots/docs) and where the detailed log lives.
+
 ## [0.5.0]
 
 ### Changed

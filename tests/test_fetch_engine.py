@@ -16,6 +16,16 @@ class FakeResponse:
     async def read(self):
         return self._body
 
+    @property
+    def content(self):
+        body = self._body
+
+        class _Streamer:
+            async def iter_chunked(self, size):
+                for i in range(0, len(body), size):
+                    yield body[i:i + size]
+        return _Streamer()
+
 
 class FakeSession:
     """Scripted aiohttp session: pops one FakeResponse per request."""
@@ -92,9 +102,10 @@ class TestFetch:
             FakeResponse(status=503),
             FakeResponse(status=503),
         ])
-        # The final 503 is returned as-is (no more retries left).
-        outcome = await engine.fetch("https://x.com/")
-        assert outcome.status == 503
+        # Retries exhausted -> the fetch FAILS (the URL goes to failed_urls.txt
+        # for --retry); the 503 error page must never be archived as content.
+        with pytest.raises(Exception, match="HTTP 503"):
+            await engine.fetch("https://x.com/")
 
     async def test_transport_error_retries_then_raises(self):
         engine = make_engine([
@@ -142,6 +153,32 @@ class TestFetch:
         outcome = await engine.fetch("https://x.com/report.pdf")
         assert outcome.kind == "file"
         assert outcome.content == b"%PDF-1.4 fake"
+
+    async def test_file_skipped_via_content_length(self):
+        engine = make_engine([FakeResponse(
+            body=b"x" * 10,
+            headers={"Content-Type": "application/pdf", "Content-Length": "999"})],
+            max_file_size=100)
+        outcome = await engine.fetch("https://x.com/big.pdf")
+        assert outcome.detail == "file too large"
+        assert outcome.content == b""
+
+    async def test_html_page_size_cap_fails_fetch(self):
+        # A decompression-bomb-sized HTML body must fail the fetch, not be
+        # buffered and archived.
+        engine = make_engine([FakeResponse(body=b"<p>" + b"x" * 500)],
+                             max_page_size=100)
+        with pytest.raises(Exception, match="Failed after"):
+            await engine.fetch("https://x.com/")
+
+    async def test_file_skipped_via_streaming_cap(self):
+        # No Content-Length: the capped chunked read must bail mid-stream.
+        engine = make_engine([FakeResponse(
+            body=b"x" * 300, headers={"Content-Type": "application/pdf"})],
+            max_file_size=100)
+        outcome = await engine.fetch("https://x.com/big.pdf")
+        assert outcome.detail == "file too large"
+        assert outcome.content == b""
 
     async def test_charset_windows1252_forced_utf8(self):
         engine = make_engine([FakeResponse(
@@ -267,3 +304,13 @@ class TestRobots:
     async def test_wait_politeness_flat_delay(self):
         engine = FetchEngine(delay_between_requests=0)
         await engine.wait_politeness()  # should just not hang
+
+    async def test_wait_politeness_paces_globally(self):
+        # N concurrent waiters must be spaced ~delay apart in total, not all
+        # sleep in parallel (the old no-op behavior).
+        engine = FetchEngine(delay_between_requests=0.05)
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        await asyncio.gather(*(engine.wait_politeness() for _ in range(4)))
+        elapsed = loop.time() - start
+        assert elapsed >= 0.05 * 3 * 0.9  # 4 requests -> >= ~3 gaps

@@ -10,9 +10,14 @@ from .config import CONFIG, _DEFAULT_EXCLUDE_PATTERNS
 from .crawler import WebsiteScraper
 
 
-def collect_urls(args) -> list[str]:
-    """Collect URLs from CLI arg and/or file."""
+def collect_urls(args) -> tuple[list[str], set[str]]:
+    """Collect URLs from CLI arg and/or file.
+
+    Returns ``(urls, retry_urls)`` — retry URLs are also in *urls* but must be
+    force-requeued (their previous visit is what put them in the failed list).
+    """
     urls = []
+    retry_urls: set[str] = set()
     if args.url:
         urls.append(args.url)
     if args.file:
@@ -27,7 +32,8 @@ def collect_urls(args) -> list[str]:
             line = line.strip()
             if line and not line.startswith('#'):
                 urls.append(line)
-    return urls
+                retry_urls.add(line)
+    return urls, retry_urls
 
 
 def parse_args():
@@ -44,6 +50,10 @@ def parse_args():
                         help=f"Delay between requests in seconds (default: {CONFIG['delay_between_requests']})")
     parser.add_argument('--fresh', '-F', action='store_true',
                         help='Ignore any saved checkpoint and start fresh')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                        help='Show per-URL activity on the console (fetches, saves, '
+                             'fallbacks, errors); default console shows milestones + '
+                             'periodic progress, full detail always goes to logs/scrape.log')
     parser.add_argument('--fullname', '-n', action='store_true',
                         help='Prefix output filenames with the host (fully-qualified, e.g. example.com_about.md)')
     parser.add_argument('--render', choices=('auto', 'never', 'always'), default='auto',
@@ -83,7 +93,7 @@ def parse_args():
 
 async def main():
     args = parse_args()
-    urls = collect_urls(args)
+    urls, retry_urls = collect_urls(args)
 
     if not urls:
         print("Error: provide a URL, --file, or --retry")
@@ -127,12 +137,18 @@ async def main():
                 fullname=args.fullname,
                 extract_docs=args.extract_docs,
                 human=args.human,
+                verbose=args.verbose,
             )
-            # Seed any additional URLs for this domain
+            # Seed this domain's URLs. Retry URLs were VISITED by a previous
+            # run (that's how they failed), so they must be force-requeued —
+            # enqueue() alone would reject them against the resumed state.db.
+            if domain_urls[0] in retry_urls:
+                scraper.requeue(domain_urls[0])
             for extra in domain_urls[1:]:
-                normalized = scraper.normalize_url(extra)
-                if not scraper.url_store.contains(normalized):
-                    scraper.urls_to_visit.append(normalized)
+                if extra in retry_urls:
+                    scraper.requeue(extra)
+                else:
+                    scraper.enqueue(scraper.normalize_url(extra))
             tg.create_task(scraper.run())
 
 

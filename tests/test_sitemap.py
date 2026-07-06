@@ -30,8 +30,8 @@ class _FakeResp:
     def __init__(self, data):
         self._data = data
 
-    def read(self):
-        return self._data
+    def read(self, n=None):
+        return self._data if n is None else self._data[:n]
 
     def __enter__(self):
         return self
@@ -42,7 +42,7 @@ class _FakeResp:
 
 def _fake_urlopen(responses):
     """responses: dict url -> bytes; anything else raises."""
-    def opener(req, timeout=None):
+    def opener(req, timeout=None, context=None):
         url = req.full_url
         if url in responses:
             return _FakeResp(responses[url])
@@ -80,3 +80,37 @@ def test_max_urls_cap():
     with patch.object(sitemap, "urlopen",
                       _fake_urlopen({"https://x.com/sitemap.xml": SITEMAP_PLAIN})):
         assert sitemap._fetch_sitemap_urls("x.com", max_urls=1) == ["https://x.com/a"]
+
+
+def test_dtd_refused():
+    bomb = (b'<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol">]>'
+            b'<urlset><url><loc>https://x.com/a</loc></url></urlset>')
+    with patch.object(sitemap, "urlopen",
+                      _fake_urlopen({"https://x.com/sitemap.xml": bomb})):
+        assert sitemap._fetch_sitemap_urls("x.com") == []
+
+
+def test_cross_host_and_unsafe_children_rejected():
+    evil_index = b"""<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sitemap><loc>http://169.254.169.254/latest/meta-data</loc></sitemap>
+  <sitemap><loc>file:///etc/passwd</loc></sitemap>
+  <sitemap><loc>https://evil.com/sub.xml</loc></sitemap>
+  <sitemap><loc>https://www.x.com/sub1.xml</loc></sitemap>
+</sitemapindex>"""
+    fetched = []
+
+    def tracking_opener(req, timeout=None, context=None):
+        fetched.append(req.full_url)
+        data = {"https://x.com/sitemap.xml": evil_index,
+                "https://www.x.com/sub1.xml": SUB1}.get(req.full_url)
+        if data is None:
+            raise OSError("no fixture")
+        return _FakeResp(data)
+
+    with patch.object(sitemap, "urlopen", tracking_opener):
+        urls = sitemap._fetch_sitemap_urls("x.com")
+    # Only the same-site (www-alias) child was fetched; SSRF targets were not.
+    assert "https://x.com/one" in urls
+    assert not any("169.254" in u or u.startswith("file:") or "evil.com" in u
+                   for u in fetched)

@@ -27,7 +27,7 @@ from .extract import _extract_document_to_markdown, _parse_and_extract
 from .fetch import FetchEngine, should_download_file
 from .sitemap import _fetch_sitemap_urls
 from .store import URLStore
-from .urls import _normalize_url, _url_excluded
+from .urls import _canonicalize_host, _normalize_url, _same_host, _url_excluded
 
 
 class WebsiteScraper:
@@ -40,9 +40,22 @@ class WebsiteScraper:
                  ignore_robots: bool = False,
                  fullname: bool = False,
                  extract_docs: bool = True,
-                 human: bool = False):
+                 human: bool = False,
+                 verbose: bool = False):
         self.start_url = start_url
         self.base_domain = self.extract_domain(start_url)
+        self.base_scheme = urlparse(start_url).scheme or 'https'
+        self.fresh = fresh
+
+        # The netloc becomes a path segment of the output tree — refuse
+        # anything that isn't a plain host[:port] / [v6][:port] so a malformed
+        # seed URL (e.g. from an untrusted --file list) can't steer writes
+        # outside data/ (urlparse('http://../x').netloc is '..').
+        if ('..' in self.base_domain
+                or not re.fullmatch(
+                    r'(?:[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(?::\d+)?',
+                    self.base_domain)):
+            raise ValueError(f"Refusing to crawl invalid host in URL: {start_url!r}")
 
         # Crawl-quality knobs
         self.strip_tracking_params = strip_tracking_params
@@ -66,6 +79,8 @@ class WebsiteScraper:
         self.semaphore = asyncio.Semaphore(CONFIG['max_concurrent'])
         self.denied_urls: list[str] = []
         self.failed_urls: list[str] = []
+        self.not_found_urls: list[str] = []
+        self.challenged_urls: list[str] = []
 
         # Stats
         self.stats = {
@@ -77,6 +92,8 @@ class WebsiteScraper:
             'robots_skipped': 0,
             'errors': 0,
             'denied': 0,
+            'not_found': 0,
+            'challenged': 0,
             'total_bytes': 0,
         }
 
@@ -98,9 +115,9 @@ class WebsiteScraper:
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
         self.logger.addHandler(fh)
-        # Console handler (INFO only)
+        # Console handler (INFO by default; --verbose shows every per-URL event)
         ch = logging.StreamHandler()
-        ch.setLevel(logging.INFO)
+        ch.setLevel(logging.DEBUG if verbose else logging.INFO)
         ch.setFormatter(logging.Formatter('%(message)s'))
         self.logger.addHandler(ch)
 
@@ -117,7 +134,14 @@ class WebsiteScraper:
         # SQLite-backed URL store
         self.url_store = URLStore(self.logs_dir / 'state.db')
 
-        # Handle fresh start vs resume
+        # Output paths claimed this run (see _reserve_path): the event loop is
+        # single-threaded and claims happen without an intervening await, so
+        # this set makes filename collision handling race-free.
+        self._claimed_paths: set[str] = set()
+
+        # Handle fresh start vs resume. _queued mirrors urls_to_visit as a set
+        # so a link seen on many pages is enqueued once, not once per page —
+        # keeping the queue (and its 30s checkpoint) proportional to the site.
         if fresh:
             self.url_store.clear()
             self.urls_to_visit: Deque[str] = deque([start_url])
@@ -130,9 +154,16 @@ class WebsiteScraper:
                 self.urls_to_visit = saved_queue
                 if saved_stats:
                     self.stats.update(saved_stats)
+                # Restore the report lists too, so access_denied.txt /
+                # failed_urls.txt etc. stay complete across crash + resume.
+                self.denied_urls = self.url_store.load_url_list('denied')
+                self.failed_urls = self.url_store.load_url_list('failed')
+                self.not_found_urls = self.url_store.load_url_list('not_found')
+                self.challenged_urls = self.url_store.load_url_list('challenged')
                 self.logger.info(f"Resuming: {self.url_store.count} URLs visited, {len(saved_queue)} in queue")
             else:
                 self.urls_to_visit = deque([start_url])
+        self._queued: set[str] = set(self.urls_to_visit)
 
         # ProcessPoolExecutor for CPU-bound parsing
         self.executor = ProcessPoolExecutor(max_workers=os.cpu_count())
@@ -140,6 +171,16 @@ class WebsiteScraper:
         self.logger.info(f"Output directory: {self.base_dir}")
         self.logger.info(f"Starting domain: {self.base_domain}")
         self.logger.info(f"Max concurrent requests: {CONFIG['max_concurrent']}")
+        self.logger.info(
+            f"Mode: render={render_mode}"
+            f"{', human (interactive browser)' if human else ''}"
+            f"{', robots ignored' if ignore_robots else ''}"
+            f"{'' if extract_docs else ', no doc extraction'}"
+            f"{' — verbose console' if verbose else ''}"
+        )
+        if not verbose:
+            self.logger.info("Tip: per-URL detail is in "
+                             f"{self.logs_dir / 'scrape.log'} (or run with --verbose)")
 
     @staticmethod
     def extract_domain(url: str) -> str:
@@ -150,7 +191,45 @@ class WebsiteScraper:
         return _normalize_url(url, strip_tracking=self.strip_tracking_params)
 
     def is_same_domain(self, url: str) -> bool:
-        return self.extract_domain(url) == self.base_domain
+        return _same_host(self.extract_domain(url), self.base_domain)
+
+    def enqueue(self, url: str) -> bool:
+        """Add *url* to the crawl queue unless already visited or queued.
+        Returns True iff it was actually enqueued."""
+        if url in self._queued or self.url_store.contains(url):
+            return False
+        self._queued.add(url)
+        self.urls_to_visit.append(url)
+        return True
+
+    def requeue(self, url: str) -> bool:
+        """Force *url* back into the crawl queue even if a previous run already
+        visited it — the --retry path. Without the forget(), retry URLs would
+        be silently rejected by the visited-set guard and the retry would be a
+        no-op against an existing state.db."""
+        normalized = self.normalize_url(url)
+        for u in {url, normalized}:
+            self.url_store.forget(u)
+        return self.enqueue(normalized)
+
+    def _reserve_path(self, directory: Path, stem: str, ext: str) -> Path:
+        """Claim a unique output path for this run (race-free: no await between
+        the check and the claim, and the event loop is single-threaded).
+
+        Files left on disk by a PREVIOUS run force a collision suffix only when
+        resuming; under --fresh they are overwritten, so a fresh re-crawl
+        produces deterministic filenames instead of accumulating _1/_2 dupes.
+        Two different URLs mapping to the same stem within one run still get
+        distinct suffixed files.
+        """
+        counter = 0
+        while True:
+            name = f"{stem}{ext}" if counter == 0 else f"{stem}_{counter}{ext}"
+            path = directory / name
+            if str(path) not in self._claimed_paths and (self.fresh or not path.exists()):
+                self._claimed_paths.add(str(path))
+                return path
+            counter += 1
 
     def should_download_file(self, url: str, content_type: str = None) -> bool:
         return should_download_file(url, content_type)
@@ -178,7 +257,11 @@ class WebsiteScraper:
                 if self.fullname and parsed.netloc:
                     original_name = f"{parsed.netloc}_{original_name}"
                 original_name = re.sub(r'[^\w\s\-\.]', '_', original_name)
-                return original_name
+                # A stem of only dots/underscores/dashes (e.g. a path ending
+                # in '/..') is not a usable filename — fall through to the
+                # hash-based name instead of handing '..' to _reserve_path.
+                if original_name.strip('._- \t'):
+                    return original_name
         url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
         ext = self.get_file_extension(url, content_type)
         return f"file_{url_hash}{ext}"
@@ -211,22 +294,17 @@ class WebsiteScraper:
         await self.engine.close()
 
     async def download_file(self, url: str, content: bytes, content_type: str):
+        # Atomic check-and-claim: two concurrent downloads of identical bytes
+        # can't both pass the check and write duplicate files.
         file_hash = hashlib.md5(content).hexdigest()
-        if self.url_store.has_file_hash(file_hash):
+        if not self.url_store.add_file_hash(file_hash):
             return
 
-        filename = self.generate_filename(url, content_type)
-        filepath = self.files_dir / filename
-
-        counter = 1
-        while filepath.exists():
-            name, ext = os.path.splitext(filename)
-            filepath = self.files_dir / f"{name}_{counter}{ext}"
-            counter += 1
+        name, ext = os.path.splitext(self.generate_filename(url, content_type))
+        filepath = self._reserve_path(self.files_dir, name, ext)
 
         async with aiofiles.open(filepath, 'wb') as f:
             await f.write(content)
-        self.url_store.add_file_hash(file_hash)
         self.stats['files_downloaded'] += 1
         self.stats['total_bytes'] += len(content)
 
@@ -251,11 +329,7 @@ class WebsiteScraper:
         if not markdown:
             return
         stem = os.path.splitext(filepath.name)[0]
-        out = self.text_dir / f"{stem}.md"
-        counter = 1
-        while out.exists():
-            out = self.text_dir / f"{stem}_{counter}.md"
-            counter += 1
+        out = self._reserve_path(self.text_dir, stem, '.md')
         async with aiofiles.open(out, 'w', encoding='utf-8') as f:
             await f.write(markdown)
         self.stats['docs_extracted'] += 1
@@ -263,12 +337,7 @@ class WebsiteScraper:
 
     async def save_html(self, url: str, content: str):
         stem = self.generate_html_filename(url)
-        filepath = self.pages_dir / f"{stem}.html"
-
-        counter = 1
-        while filepath.exists():
-            filepath = self.pages_dir / f"{stem}_{counter}.html"
-            counter += 1
+        filepath = self._reserve_path(self.pages_dir, stem, '.html')
 
         async with aiofiles.open(filepath, 'w', encoding='utf-8') as f:
             await f.write(content)
@@ -279,12 +348,7 @@ class WebsiteScraper:
     async def save_text(self, url: str, text: str):
         """Save extracted clean text for LLM consumption."""
         stem = self.generate_html_filename(url)
-        filepath = self.text_dir / f"{stem}.md"
-
-        counter = 1
-        while filepath.exists():
-            filepath = self.text_dir / f"{stem}_{counter}.md"
-            counter += 1
+        filepath = self._reserve_path(self.text_dir, stem, '.md')
 
         async with aiofiles.open(filepath, 'w', encoding='utf-8') as f:
             await f.write(text)
@@ -317,18 +381,36 @@ class WebsiteScraper:
                     url, run_extract=self._run_extract)
 
                 if outcome.kind == 'file':
-                    if len(outcome.content) > CONFIG['max_file_size']:
-                        self.logger.debug(
-                            f"Skipping large file: {url} "
-                            f"({len(outcome.content) / (1024*1024):.2f} MB)")
+                    # The aiohttp path already skips oversized files up front
+                    # (outcome.detail); the length check covers the curl_cffi /
+                    # browser paths, which still buffer whole responses.
+                    if (outcome.detail == 'file too large'
+                            or len(outcome.content) > CONFIG['max_file_size']):
+                        self.logger.debug(f"Skipping large file: {url}")
                         return
                     await self.download_file(url, outcome.content, outcome.content_type)
                 else:
+                    if outcome.classification == 'not_found':
+                        self.stats['not_found'] += 1
+                        self.not_found_urls.append(url)
+                        self.logger.debug(f"Not found ({outcome.detail}): {url}")
+                        return
+                    if outcome.classification == 'challenge':
+                        # Every escalation tier failed to clear this challenge.
+                        # Rare and actionable (--human / cookie bridge), so INFO.
+                        self.stats['challenged'] += 1
+                        self.challenged_urls.append(url)
+                        self.logger.info(
+                            f"Blocked by challenge ({outcome.detail}): {url}")
+                        return
                     if outcome.denied:
                         self.stats['denied'] += 1
                         self.denied_urls.append(url)
-                        self.logger.debug(f"Access denied ({outcome.status}): {url}")
+                        self.logger.debug(
+                            f"Access denied ({outcome.detail or outcome.status}): {url}")
                         return
+                    if outcome.classification == 'search':
+                        self.logger.debug(f"Search-results page: {url}")
 
                     # Escalated headless render (auto/always); --human fetches are
                     # browser-native already and were never counted here.
@@ -342,10 +424,9 @@ class WebsiteScraper:
                     if extracted_text and extracted_text.strip():
                         await self.save_text(url, extracted_text)
 
-                    # Queue new links
+                    # Queue new links (deduped against visited AND queued)
                     for link in links:
-                        if not self.url_store.contains(link):
-                            self.urls_to_visit.append(link)
+                        self.enqueue(link)
 
             except Exception as e:
                 self.stats['errors'] += 1
@@ -364,17 +445,26 @@ class WebsiteScraper:
                 f"{self.stats['files_downloaded']} files | "
                 f"{self.stats['docs_extracted']} docs | "
                 f"{self.stats['denied']} denied | "
+                f"{self.stats['not_found']} 404s | "
                 f"{self.stats['errors']} errors | "
                 f"{self.stats['total_bytes'] / (1024*1024):.1f} MB | "
                 f"{len(self.urls_to_visit)} queued"
             )
 
+    def _save_checkpoint(self):
+        self.url_store.save_queue(self.urls_to_visit)
+        self.url_store.save_stats(self.stats)
+        self.url_store.save_url_list('denied', self.denied_urls)
+        self.url_store.save_url_list('failed', self.failed_urls)
+        self.url_store.save_url_list('not_found', self.not_found_urls)
+        self.url_store.save_url_list('challenged', self.challenged_urls)
+
     async def _checkpoint_saver(self):
-        """Periodically checkpoint queue + stats to SQLite for crash recovery."""
+        """Periodically checkpoint queue + stats + report lists to SQLite for
+        crash recovery."""
         while True:
             await asyncio.sleep(CONFIG['checkpoint_interval'])
-            self.url_store.save_queue(self.urls_to_visit)
-            self.url_store.save_stats(self.stats)
+            self._save_checkpoint()
             self.logger.debug(f"Checkpoint saved: {len(self.urls_to_visit)} URLs in queue")
 
     async def crawl(self):
@@ -390,26 +480,39 @@ class WebsiteScraper:
         if self.human:
             await self.engine._ensure_browser()
 
-        # Seed from sitemap if enabled (best-effort, non-blocking)
+        # Seed from sitemap if enabled (best-effort). This runs before the
+        # progress reporter starts and can take a while on large sitemap
+        # indexes — narrate it so the crawl never looks hung here.
         if self.use_sitemap:
+            self.logger.info("Checking sitemap.xml for seed URLs...")
             parsed_start = urlparse(self.start_url)
-            sitemap_urls = _fetch_sitemap_urls(
-                self.base_domain, scheme=parsed_start.scheme or "https",
-            )
+            loop = asyncio.get_running_loop()
+            sitemap_urls = await loop.run_in_executor(
+                None, lambda: _fetch_sitemap_urls(
+                    self.base_domain, scheme=parsed_start.scheme or "https",
+                    allow_insecure_tls=self.allow_insecure_tls,
+                ))
             if sitemap_urls:
                 added = 0
                 for surl in sitemap_urls:
                     normalized = _normalize_url(surl, strip_tracking=self.strip_tracking_params)
                     nparsed = urlparse(normalized)
-                    if nparsed.netloc != self.base_domain:
+                    if not _same_host(nparsed.netloc, self.base_domain):
                         continue
+                    if nparsed.netloc != self.base_domain or nparsed.scheme != self.base_scheme:
+                        # Collapse www/scheme aliases onto the crawl's canonical
+                        # host so sitemap seeds dedup against discovered links.
+                        normalized = _canonicalize_host(
+                            normalized, self.base_scheme, self.base_domain,
+                            strip_tracking=self.strip_tracking_params)
                     if _url_excluded(normalized, self._compiled_exclude_patterns):
                         continue
-                    if not self.url_store.contains(normalized):
-                        self.urls_to_visit.append(normalized)
+                    if self.enqueue(normalized):
                         added += 1
                 if added:
                     self.logger.info(f"Sitemap: seeded {added} URLs from sitemap.xml")
+            else:
+                self.logger.info("No usable sitemap.xml; discovering links by crawling")
 
         # Start background tasks
         progress_task = asyncio.create_task(self._progress_reporter())
@@ -421,6 +524,7 @@ class WebsiteScraper:
             while self.urls_to_visit or tasks:
                 while self.urls_to_visit and len(tasks) < CONFIG['max_concurrent']:
                     url = self.urls_to_visit.popleft()
+                    self._queued.discard(url)
 
                     if not self.url_store.contains(url):
                         self.url_store.add(url)
@@ -435,8 +539,7 @@ class WebsiteScraper:
             progress_task.cancel()
             checkpoint_task.cancel()
             # Final checkpoint
-            self.url_store.save_queue(self.urls_to_visit)
-            self.url_store.save_stats(self.stats)
+            self._save_checkpoint()
             await self.close_session()
 
     async def run(self):
@@ -460,6 +563,16 @@ class WebsiteScraper:
             async with aiofiles.open(failed_file, 'w', encoding='utf-8') as f:
                 await f.write('\n'.join(self.failed_urls) + '\n')
 
+        # Write not-found and still-challenged URLs for post-crawl review
+        if self.not_found_urls:
+            async with aiofiles.open(self.logs_dir / 'not_found.txt', 'w',
+                                     encoding='utf-8') as f:
+                await f.write('\n'.join(self.not_found_urls) + '\n')
+        if self.challenged_urls:
+            async with aiofiles.open(self.logs_dir / 'challenged_urls.txt', 'w',
+                                     encoding='utf-8') as f:
+                await f.write('\n'.join(self.challenged_urls) + '\n')
+
         self.logger.info("")
         self.logger.info("=" * 80)
         self.logger.info("SCRAPING COMPLETED")
@@ -472,12 +585,19 @@ class WebsiteScraper:
         self.logger.info(f"Files downloaded: {self.stats['files_downloaded']}")
         self.logger.info(f"Documents extracted: {self.stats['docs_extracted']}")
         self.logger.info(f"Access denied: {self.stats['denied']}")
+        self.logger.info(f"Not found (404): {self.stats['not_found']}")
+        self.logger.info(f"Blocked by challenge: {self.stats['challenged']}")
         self.logger.info(f"Skipped (robots.txt): {self.stats['robots_skipped']}")
         self.logger.info(f"Total data: {self.stats['total_bytes'] / (1024*1024):.2f} MB")
         self.logger.info(f"Errors: {self.stats['errors']}")
         self.logger.info(f"Output location: {self.base_dir}")
         if self.denied_urls:
             self.logger.info(f"Denied URLs logged to: {self.logs_dir / 'access_denied.txt'}")
+        if self.not_found_urls:
+            self.logger.info(f"Not-found URLs logged to: {self.logs_dir / 'not_found.txt'}")
+        if self.challenged_urls:
+            self.logger.info(f"Challenge-blocked URLs logged to: {self.logs_dir / 'challenged_urls.txt'}")
+            self.logger.info("  Retry them with --human (or export cookies to SCRAPE_CF_COOKIES)")
         if self.failed_urls:
             self.logger.info(f"Failed URLs logged to: {self.logs_dir / 'failed_urls.txt'}")
             self.logger.info(f"  Retry with: uv run python app.py --retry {self.logs_dir / 'failed_urls.txt'}")

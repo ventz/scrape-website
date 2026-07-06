@@ -191,6 +191,10 @@ class _CFSession:
         if not host:
             return False
         # The clearance cookie may already be in your real Chrome from normal browsing.
+        # browser_cookie3 decrypts Chrome's cookie store, which on macOS can block on
+        # a Keychain permission prompt — say so, or the crawl looks hung here.
+        print(f"[cf] reading {host} cookies from {self.REAL_BROWSER}'s cookie store "
+              f"(may prompt for Keychain access)...", file=sys.stderr, flush=True)
         self._read_from_chrome(host)
         if self.has_clearance_for(url):
             return True

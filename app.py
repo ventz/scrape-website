@@ -20,7 +20,10 @@ from scrape_website.config import (  # noqa: F401
     _DEFAULT_TRACKING_PARAMS,
 )
 from scrape_website.urls import (  # noqa: F401
+    _canonicalize_host,
+    _is_safe_fetch_target,
     _normalize_url,
+    _same_host,
     _strip_tracking_params,
     _url_excluded,
 )
@@ -32,6 +35,8 @@ from scrape_website.extract import (  # noqa: F401
     _looks_like_spa_shell,
     _extract_document_to_markdown,
     _looks_challenged,
+    classify_page,
+    is_access_denied,
 )
 from scrape_website.waf import _CFSession, CF_SESSION  # noqa: F401
 from scrape_website.fetch import FetchEngine, FetchOutcome, should_download_file  # noqa: F401

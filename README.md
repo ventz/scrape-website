@@ -5,6 +5,7 @@ Async website scraper that crawls an entire domain and downloads all pages (HTML
 ## Features
 
 - **Fast async crawling** — up to 100 concurrent requests (configurable)
+- **Global rate limiting** — `--delay` paces the entire crawl (default ~10 req/s crawl-wide, regardless of concurrency; `--delay 0` disables). See [Rate limiting](#rate-limiting---delay-is-a-real-global-limit-changed-in-070)
 - **JavaScript rendering (auto-escalation)** — static fetch first; when a page is detected as an un-hydrated client-rendered SPA shell (tiny text, no links), it is automatically re-fetched in headless Chromium (Playwright) and re-extracted from the hydrated DOM. Static-first by design, so only SPA pages pay the browser cost (`--render auto|never|always`)
 - **Interactive `--human` mode** — opens a **visible** browser and fetches through it, auto-pausing when it detects a Cloudflare/CAPTCHA/login challenge so you can solve it by hand; the solved session (cookies incl. `cf_clearance`) persists across pages *and across runs* via an on-disk browser profile
 - **Robust fetching** — exponential backoff with jitter, `Retry-After`-aware retries on 429/5xx, and a `curl_cffi` real-browser TLS/fingerprint fallback that retries `403`/WAF-challenge responses
@@ -15,17 +16,18 @@ Async website scraper that crawls an entire domain and downloads all pages (HTML
 - **Clean Markdown extraction** — extracts main content as Markdown using `trafilatura` (strips nav, headers, footers, boilerplate), with YAML front-matter metadata (title, url, hostname, sitename) at the top of each file
 - **Per-page deduplication** — repeated boilerplate is dropped only *within* a page; content that legitimately repeats across pages (e.g. an FAQ answer on both the FAQ page and its own page) is kept in full, so every page is a self-contained knowledge-base document
 - **Parallel HTML parsing** — `lxml` link extraction + text extraction offloaded to process pool (uses all CPU cores)
-- **SQLite-backed dedup** — exact URL deduplication with minimal RAM usage (scales to millions of URLs)
-- **Crash recovery** — auto-resumes from checkpoint on restart; use `--fresh` to start over
+- **Fast URL dedup** — visited URLs held in memory (write-through to SQLite for crash recovery), and the crawl queue itself is deduplicated, so hot-path checks never touch the database
+- **SSRF & resource-bomb hardening** — URLs sourced from crawled content (cross-host document links, sitemap-index children) are restricted to http(s) on non-internal hosts; HTML reads are capped at 50 MB decompressed, files at 100 MB (enforced before buffering), and sitemap DTDs are refused
+- **Crash recovery** — auto-resumes from checkpoint on restart (including the denied/failed/not-found report lists); use `--fresh` to start over — a fresh re-crawl overwrites the previous output with deterministic filenames instead of accumulating `_1`/`_2` duplicates
 - **Multi-domain concurrency** — all domains run in parallel via `asyncio.TaskGroup`
-- **Domain-scoped** — only follows links within the starting domain
+- **Domain-scoped** — only follows links within the starting domain; `www.example.com` and `example.com` (and http/https variants) are treated as the same site and collapse to one canonical URL, so aliases are neither missed nor crawled twice
 - **Document downloads** — PDF, DOC(X), PPT(X), XLS(X), CSV, ZIP, RTF, ODT, ODS, ODP
 - **Multiple input modes** — single URL, file with URL list, or retry from failed URLs
-- **Access-denied detection** — identifies HTTP 401/403 and CDN/WAF denial pages
+- **Page classification** — every response is classified as content / anti-bot challenge (with the vendor: Turnstile, hCaptcha, reCAPTCHA, Cloudflare interstitial) / 404 (incl. soft-404s) / access denied / search-results page; 404s and denials are counted and logged instead of being archived as content
 - **TLS escape hatch** — strict certificate verification by default; `--allow-insecure-tls` for trusted hosts with broken/expired certs
 - **Convenient short flags** — `-c`/`-t`/`-d`/`-F`/`-e`/`-n` aliases for common options
-- **Automatic retry** — failed URLs are saved for easy re-run
-- **Structured logging** — per-URL events logged to file, progress summaries every 5 seconds to console
+- **Automatic retry** — URLs that fail after all retries (timeouts, persistent 429/5xx) are saved to `failed_urls.txt` and never archived as content; `--retry` force-requeues them even though a previous run already visited them
+- **Structured logging** — per-URL events logged to file, progress summaries every 5 seconds to console; the console narrates slow operations (sitemap discovery, retry waits, WAF fallbacks, browser renders) so you always know what the crawl is doing, and `-v`/`--verbose` streams every per-URL event
 
 ## Requirements
 
@@ -111,6 +113,8 @@ Failed URLs are automatically saved to `data/<domain>/logs/failed_urls.txt` afte
 uv run python app.py --retry data/example.com/logs/failed_urls.txt
 ```
 
+Retry URLs are force-requeued: even though the previous run technically "visited" them (that's how they ended up in the failed list), `--retry` clears them from the visited state so they are genuinely re-fetched — without touching the rest of the crawl's state or re-crawling anything else.
+
 ### Resume after crash
 
 The scraper automatically checkpoints its queue and stats to SQLite every 30 seconds. If interrupted, just re-run the same command — it will resume from where it left off.
@@ -124,7 +128,7 @@ uv run python app.py https://example.com/ --fresh
 ### Tuning options
 
 ```bash
-# Throttle to 20 concurrent requests with a 0.5s delay (be polite)
+# Throttle to 20 concurrent requests, paced to ~2 req/s crawl-wide
 uv run python app.py https://example.com/ --concurrency 20 --delay 0.5
 
 # Increase timeout for slow servers
@@ -138,11 +142,12 @@ uv run python app.py https://example.com/ --concurrency 50 --timeout 60 --delay 
 |------|---------|-------------|
 | `--concurrency`, `-c` | `100` | Max concurrent requests |
 | `--timeout`, `-t` | `30` | Request timeout in seconds |
-| `--delay`, `-d` | `0.1` | Delay between requests in seconds |
+| `--delay`, `-d` | `0.1` | Global request pacing: one request per this many seconds across the whole crawl (`0` disables) |
 | `--file`, `-f` | — | File with URLs to scrape (one per line) |
 | `--retry`, `-r` | — | File with failed URLs to retry |
 | `--fresh`, `-F` | — | Ignore saved checkpoint and start fresh |
 | `--fullname`, `-n` | — | Prefix output filenames with the host (`example.com_about.md`) |
+| `--verbose`, `-v` | — | Show per-URL activity on the console (fetches, saves, fallbacks, errors); full detail always goes to `logs/scrape.log` |
 | `--render` | `auto` | JS rendering: `auto` (only SPA shells), `always` (every page), `never` (disable) |
 | `--human` | — | Open a visible browser, fetch through it, and pause for you to solve challenges/logins (forces `--concurrency 1`) |
 | `--allow-insecure-tls` | — | Disable TLS certificate verification (trusted hosts with broken certs) |
@@ -179,7 +184,7 @@ python app.py --human "https://example.com/"
 What it does:
 
 - Opens a **real, visible Chromium window** and fetches every page through it — so requests carry a genuine browser fingerprint (the only reliable way to reuse a solved Cloudflare `cf_clearance` cookie).
-- **Crawls normally until it hits a challenge.** When it detects a Cloudflare interstitial, CAPTCHA, or login page, it brings the window to the front and pauses with a prompt in your terminal. You solve it in the browser, press **Enter**, and the crawl continues — now carrying the cleared session.
+- **Crawls normally until it hits a genuine challenge.** When it detects a Cloudflare interstitial, Turnstile/hCaptcha/reCAPTCHA, or login page, it brings the window to the front and pauses with a prompt in your terminal that names what was detected. You solve it in the browser, press **Enter**, and the crawl continues — now carrying the cleared session. Pages that merely *look* blocked but have nothing to solve — a 404/soft-404, a plain 403, a search-results page — are classified as such and never pause the crawl (404s go to `logs/not_found.txt`, denials to `logs/access_denied.txt`).
 - **Remembers the session.** The browser profile is saved under `data/<domain>/logs/browser_profile/`, so a session you solve (or a login you complete) persists across pages and is reused on future runs — solve once, crawl for days.
 - Forces `--concurrency 1` so there's a single window and an unambiguous prompt.
 
@@ -205,6 +210,25 @@ Solve **once per host** — the cookie is cached for the rest of the run. The de
 ```bash
 uv run python app.py https://example.com/ --ignore-robots
 ```
+
+#### Rate limiting: `--delay` is a real, global limit (changed in 0.7.0)
+
+`--delay` paces the **whole crawl**: one request per `--delay` seconds *across all concurrent tasks*, regardless of `--concurrency`. The default of `0.1` means the crawler never exceeds ~10 requests/second against the target site.
+
+> **Behavior change (0.7.0):** in earlier versions each task slept independently, so at the default concurrency of 100 the delay throttled essentially nothing — crawls ran at whatever rate the site could absorb. The delay now does what it always claimed to. This makes default crawls **politer and slower** than before.
+
+```bash
+# Default: ~10 req/s crawl-wide (0.1s between requests)
+uv run python app.py https://example.com/
+
+# Gentler: ~2 req/s
+uv run python app.py https://example.com/ --delay 0.5
+
+# Old full-speed behavior: disable pacing entirely (only concurrency limits apply)
+uv run python app.py https://example.com/ --delay 0
+```
+
+When robots.txt declares a `Crawl-Delay`, that takes precedence over `--delay` for the run.
 
 ### Hard / misconfigured sites
 
@@ -255,9 +279,11 @@ data/
     files/              # Downloaded documents (PDF, DOCX, etc.)
     logs/
       scrape.log        # Full debug log
-      state.db          # SQLite DB (visited URLs, queue, stats)
+      state.db          # SQLite DB (visited URLs, queue, stats, report lists)
       access_denied.txt # URLs that returned 401/403 (if any)
-      failed_urls.txt   # URLs that failed after retries (if any)
+      failed_urls.txt   # URLs that failed after retries (if any) — feed to --retry
+      not_found.txt     # 404/410 + soft-404 URLs (if any)
+      challenged_urls.txt # URLs still blocked by an anti-bot challenge (if any)
   docs.example.com/
     pages/
     text/
@@ -278,21 +304,33 @@ Deduplication is **per-page only**: `trafilatura`'s repetition cache is reset be
 Output directory: data/privsec.harvard.edu
 Starting domain: privsec.harvard.edu
 Max concurrent requests: 100
+Mode: render=auto
+Tip: per-URL detail is in data/privsec.harvard.edu/logs/scrape.log (or run with --verbose)
 Starting scraper at 2026-03-12 14:01:58
+scrape-website v0.7.0 — crawling privsec.harvard.edu
+Checking sitemap.xml for seed URLs...
+Sitemap: seeded 87 URLs from sitemap.xml
+Progress: 42 visited | 39 pages | 36 text | 0 rendered | 1 files | 1 docs | 2 denied | 0 404s | 0 errors | 1.9 MB | 55 queued
 
 ================================================================================
 SCRAPING COMPLETED
 ================================================================================
-Duration: 4.00 seconds
+Duration: 14.20 seconds
 URLs visited: 104
 Pages downloaded: 98
 Text extracted: 91
+Pages rendered (JS): 0
 Files downloaded: 3
+Documents extracted: 3
 Access denied: 3
+Not found (404): 2
+Blocked by challenge: 0
+Skipped (robots.txt): 0
 Total data: 4.63 MB
 Errors: 0
 Output location: data/privsec.harvard.edu
 Denied URLs logged to: data/privsec.harvard.edu/logs/access_denied.txt
+Not-found URLs logged to: data/privsec.harvard.edu/logs/not_found.txt
 ================================================================================
 
 % ls data/privsec.harvard.edu/

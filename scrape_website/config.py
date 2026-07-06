@@ -24,10 +24,15 @@ CONFIG = {
     ),
     'delay_between_requests': 0.1,  # Politeness delay in seconds
     'max_file_size': 100 * 1024 * 1024,  # 100MB max file size
+    # Max DECOMPRESSED HTML page size. aiohttp transparently inflates
+    # gzip/br/zstd, so without a cap a small compression-bomb response could
+    # balloon to GBs in memory (x concurrency). Real pages are nowhere close.
+    'max_page_size': 50 * 1024 * 1024,
     'checkpoint_interval': 30,  # Seconds between queue checkpoints
     'progress_interval': 5,  # Seconds between progress reports
     'render_timeout': 30,  # Max seconds for the initial headless navigation
     'render_settle_ms': 3000,  # Extra wait after DOM load for JS to hydrate
+    'max_render_concurrency': 4,  # Max simultaneous headless-Chromium renders
 }
 
 # HTTP status codes worth retrying (transient): rate-limit + server errors.

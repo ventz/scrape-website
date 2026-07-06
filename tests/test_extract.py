@@ -6,6 +6,7 @@ from scrape_website.extract import (
     _extract_text_trafilatura,
     _looks_challenged,
     _looks_like_spa_shell,
+    classify_page,
     is_access_denied,
 )
 
@@ -31,6 +32,26 @@ class TestExtractLinks:
         assert "https://x.com/files/report.pdf" in links
         assert "https://x.com/data/feed.csv" in links       # non-<a> downloadable
         assert not any(link.endswith(".jpg") for link in links)
+
+    def test_www_and_scheme_aliases_unify(self):
+        html = """<html><body>
+        <a href="https://www.x.com/team">team</a>
+        <a href="http://x.com/contact">contact</a>
+        </body></html>"""
+        links = _extract_links_lxml(html, "https://x.com/", "x.com")
+        assert "https://x.com/team" in links
+        assert "https://x.com/contact" in links
+        assert not any("www." in link or link.startswith("http://") for link in links)
+
+    def test_non_anchor_downloadables_are_ssrf_gated(self):
+        html = """<html><body>
+        <img src="http://169.254.169.254/latest/meta-data/x.csv">
+        <script src="file:///etc/passwd.csv"></script>
+        <img src="https://cdn.other.com/report.pdf">
+        </body></html>"""
+        links = _extract_links_lxml(html, "https://x.com/", "x.com")
+        assert "https://cdn.other.com/report.pdf" in links  # public CDN ok
+        assert not any("169.254" in link or link.startswith("file:") for link in links)
 
     def test_exclude_patterns(self):
         links = _extract_links_lxml(PAGE, "https://x.com/", "x.com",
@@ -86,6 +107,41 @@ class TestAccessDenied:
 
     def test_normal(self):
         assert is_access_denied(PAGE, 200) is False
+
+
+class TestClassifyPage:
+    def test_normal_content(self):
+        assert classify_page(PAGE, 200, "https://x.com/about") == ('content', '')
+
+    def test_challenge_wins_over_status(self):
+        kind, detail = classify_page("<div class='cf-turnstile'></div>", 403)
+        assert kind == 'challenge'
+        assert 'Turnstile' in detail
+
+    def test_challenge_vendor_labels(self):
+        assert classify_page("<title>Just a moment...</title>", 200)[1] == 'Cloudflare interstitial'
+        assert 'hCaptcha' in classify_page("<div class='hcaptcha'></div>", 200)[1]
+        assert 'reCAPTCHA' in classify_page("<div class='g-recaptcha'></div>", 200)[1]
+
+    def test_hard_404(self):
+        assert classify_page(PAGE, 404) == ('not_found', 'HTTP 404')
+        assert classify_page(PAGE, 410) == ('not_found', 'HTTP 410')
+
+    def test_soft_404_small_body_only(self):
+        assert classify_page("<h1>Page not found</h1>", 200)[0] == 'not_found'
+        # A large real article that merely mentions the phrase is content.
+        big = PAGE + ("<p>filler</p>" * 500) + "page not found"
+        assert classify_page(big, 200)[0] == 'content'
+
+    def test_denied(self):
+        assert classify_page("x", 403)[0] == 'denied'
+        assert classify_page("x", 401)[0] == 'denied'
+        assert classify_page("<h1>Access denied</h1>", 200)[0] == 'denied'
+
+    def test_search_url(self):
+        assert classify_page(PAGE, 200, "https://x.com/search?q=foo")[0] == 'search'
+        assert classify_page(PAGE, 200, "https://x.com/?s=term")[0] == 'search'
+        assert classify_page(PAGE, 200, "https://x.com/research/")[0] == 'content'
 
 
 class TestDocumentExtraction:

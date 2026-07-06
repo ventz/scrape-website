@@ -8,7 +8,7 @@ ProcessPoolExecutor boundary used by the CLI crawler.
 import os
 import re
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 import lxml.html
 import trafilatura
@@ -19,21 +19,100 @@ from .config import (
     _CHALLENGE_MARKERS,
     _SPA_SHELL_MARKERS,
 )
-from .urls import _normalize_url, _url_excluded
+from .urls import (
+    _canonicalize_host,
+    _is_safe_fetch_target,
+    _normalize_url,
+    _same_host,
+    _url_excluded,
+)
+
+# Human-readable labels for the challenge markers in config._CHALLENGE_MARKERS,
+# so logs and the --human solve prompt say WHAT was detected (a Turnstile CAPTCHA
+# is solvable by a human; a plain Cloudflare block page usually is not).
+_CHALLENGE_LABELS: dict[str, str] = {
+    'just a moment': 'Cloudflare interstitial',
+    'checking your browser': 'Cloudflare interstitial',
+    'cf-browser-verification': 'Cloudflare browser verification',
+    'challenge-platform': 'Cloudflare challenge',
+    'cf_chl_': 'Cloudflare challenge',
+    'turnstile': 'Cloudflare Turnstile CAPTCHA',
+    'hcaptcha': 'hCaptcha CAPTCHA',
+    'g-recaptcha': 'Google reCAPTCHA',
+    'attention required': 'Cloudflare block page',
+    'verify you are human': 'human-verification challenge',
+    'enable javascript and cookies to continue': 'JS/cookie challenge interstitial',
+    'ddos protection by': 'DDoS-protection interstitial',
+}
+
+# Query keys that mark a URL as a search-results page (?q=, WordPress ?s=, ...).
+_SEARCH_QUERY_KEYS = frozenset({'q', 's', 'query', 'search', 'keyword', 'keywords'})
+
+# Phrases that mark a small HTML payload as a soft 404 / denial served with a 200.
+_SOFT_404_PHRASES = ('page not found', "page can't be found",
+                     'page could not be found', 'nothing was found')
+
+
+def _looks_like_search_url(url: str) -> bool:
+    """Does this URL look like a search-results page rather than an article?"""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if re.search(r'/search(?:/|$)', parsed.path.lower()):
+        return True
+    keys = {k.lower() for k, v in parse_qsl(parsed.query) if v}
+    return bool(keys & _SEARCH_QUERY_KEYS)
+
+
+def classify_page(html: str, status: int, url: str = '') -> tuple[str, str]:
+    """Classify a fetched HTML payload so callers can react (and report)
+    appropriately instead of lumping every non-page into "challenge".
+
+    Returns ``(kind, detail)`` where *kind* is one of:
+      - ``'challenge'`` — anti-bot/CAPTCHA interstitial (solvable, escalate);
+      - ``'not_found'`` — hard 404/410 or a soft-404 body (skip, count);
+      - ``'denied'``    — 401/403 or an access-denied body (skip, count);
+      - ``'search'``    — a search-results page (real content, but flagged);
+      - ``'content'``   — a normal page.
+    *detail* is a short human-readable reason (e.g. which CAPTCHA vendor).
+    """
+    low = (html or '').lower()
+    # Challenge markers win over status codes: Cloudflare serves its
+    # interstitials as 403/503 AND as 200s, and a challenge is actionable
+    # (curl_cffi / cookie bridge / --human) where a plain denial is not.
+    for marker in _CHALLENGE_MARKERS:
+        if marker in low:
+            return 'challenge', _CHALLENGE_LABELS.get(marker, marker)
+    if status in (403, 503) and 'cloudflare' in low:
+        return 'challenge', 'Cloudflare interstitial'
+    if status in (404, 410):
+        return 'not_found', f'HTTP {status}'
+    if status in (401, 403):
+        return 'denied', f'HTTP {status}'
+    # Soft 404s / denials served with a 200: only trust small pages, so a real
+    # article that merely mentions the phrase is never misclassified.
+    if len(low) < 5000:
+        if any(p in low for p in _SOFT_404_PHRASES):
+            return 'not_found', 'soft 404 (page-not-found body)'
+        if 'access denied' in low:
+            return 'denied', 'access-denied body'
+    if url and _looks_like_search_url(url):
+        return 'search', 'search-results URL'
+    return 'content', ''
 
 
 def _looks_challenged(html: str, status: int) -> bool:
     """Is this an HTTP payload a Cloudflare/CAPTCHA interstitial rather than content?"""
-    low = (html or '').lower()
-    if any(m in low for m in _CHALLENGE_MARKERS):
-        return True
-    if status in (403, 503) and 'cloudflare' in low:
-        return True
-    return False
+    return classify_page(html, status)[0] == 'challenge'
 
 
 def is_access_denied(content: str, status: int) -> bool:
-    """Is this HTML response an access-denied page rather than content?"""
+    """Is this HTML response an access-denied page rather than content?
+
+    Legacy helper — prefer :func:`classify_page`, which also separates
+    challenges, 404s, and search pages.
+    """
     if status in (401, 403):
         return True
     if len(content) < 2000 and 'Access Denied' in content:
@@ -55,6 +134,7 @@ def _extract_links_lxml(html_content: str, base_url: str, base_domain: str,
     try:
         doc = lxml.html.fromstring(html_content)
         doc.make_links_absolute(base_url, resolve_base_href=True)
+        base_scheme = urlparse(base_url).scheme or 'https'
 
         for element, attribute, link, pos in doc.iterlinks():
             if not link or not link.startswith('http'):
@@ -64,14 +144,24 @@ def _extract_links_lxml(html_content: str, base_url: str, base_domain: str,
             tag = element.tag
 
             if tag == 'a':
-                # Follow all same-domain <a> links
-                if parsed.netloc == base_domain:
+                # Follow all same-site <a> links (www.x.com == x.com), rewriting
+                # them onto the crawl's canonical scheme + host so aliases of a
+                # page dedup to one visited-store URL.
+                if _same_host(parsed.netloc, base_domain):
+                    if parsed.scheme != base_scheme or parsed.netloc != base_domain:
+                        normalized = _canonicalize_host(
+                            normalized, base_scheme, base_domain,
+                            strip_tracking=strip_tracking)
                     if not _url_excluded(normalized, compiled):
                         links.add(normalized)
             elif tag in ('link', 'script', 'img'):
-                # Only follow non-<a> tags if they point to downloadable files
+                # Only follow non-<a> tags if they point to downloadable files.
+                # Cross-host is allowed (CDN-hosted documents are common) but
+                # SSRF-gated: a crawled page must not be able to make us fetch
+                # internal/link-local targets (e.g. cloud metadata endpoints).
                 path_lower = parsed.path.lower()
-                if any(path_lower.endswith(ext) for ext in DOWNLOADABLE_EXTENSIONS):
+                if (any(path_lower.endswith(ext) for ext in DOWNLOADABLE_EXTENSIONS)
+                        and _is_safe_fetch_target(normalized)):
                     links.add(normalized)
     except Exception:
         pass

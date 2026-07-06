@@ -4,11 +4,18 @@ import json
 import sqlite3
 from collections import deque
 from pathlib import Path
-from typing import Deque
+from typing import Deque, Iterable
 
 
 class URLStore:
-    """SQLite-backed visited URL tracking with in-memory LRU cache."""
+    """SQLite-backed visited URL tracking.
+
+    The visited set is held fully in memory (loaded once at open) and every
+    ``add`` is written through to SQLite, so ``contains`` — the crawl's
+    hottest call, hit at least twice per discovered link — never touches the
+    database or the event loop. Memory cost is roughly the URLs themselves
+    (~100-200 MB per million URLs), which is fine at any realistic crawl size.
+    """
 
     def __init__(self, db_path: Path):
         self.db_path = db_path
@@ -20,49 +27,46 @@ class URLStore:
         self.conn.execute("CREATE TABLE IF NOT EXISTS downloaded_files (hash TEXT PRIMARY KEY)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS queue (url TEXT PRIMARY KEY)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS stats (key TEXT PRIMARY KEY, value TEXT)")
-        # In-memory cache for fast lookups
-        self._cache: set[str] = set()
-        self._cache_limit = 100_000
-        self._count = self.conn.execute("SELECT COUNT(*) FROM visited").fetchone()[0]
+        # Named URL lists (denied/failed/not_found/challenged) checkpointed so
+        # the post-crawl report files stay complete across crash + resume.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS url_lists "
+            "(kind TEXT, url TEXT, PRIMARY KEY (kind, url))")
+        self._visited: set[str] = {
+            row[0] for row in self.conn.execute("SELECT url FROM visited")
+        }
 
     def contains(self, url: str) -> bool:
-        if url in self._cache:
-            return True
-        row = self.conn.execute("SELECT 1 FROM visited WHERE url=?", (url,)).fetchone()
-        if row:
-            self._add_to_cache(url)
-            return True
-        return False
+        return url in self._visited
 
     def add(self, url: str):
-        try:
-            self.conn.execute("INSERT INTO visited (url) VALUES (?)", (url,))
-            self._add_to_cache(url)
-            self._count += 1
-        except sqlite3.IntegrityError:
-            pass
+        if url in self._visited:
+            return
+        self._visited.add(url)
+        self.conn.execute("INSERT OR IGNORE INTO visited (url) VALUES (?)", (url,))
 
-    def _add_to_cache(self, url: str):
-        if len(self._cache) >= self._cache_limit:
-            # Evict ~20% of cache
-            to_remove = list(self._cache)[:self._cache_limit // 5]
-            for item in to_remove:
-                self._cache.discard(item)
-        self._cache.add(url)
+    def forget(self, url: str):
+        """Remove *url* from the visited set so it can be crawled again
+        (used by --retry to force re-fetching previously failed URLs)."""
+        self._visited.discard(url)
+        self.conn.execute("DELETE FROM visited WHERE url=?", (url,))
 
     @property
     def count(self) -> int:
-        return self._count
+        return len(self._visited)
 
     def has_file_hash(self, file_hash: str) -> bool:
         row = self.conn.execute("SELECT 1 FROM downloaded_files WHERE hash=?", (file_hash,)).fetchone()
         return row is not None
 
-    def add_file_hash(self, file_hash: str):
-        try:
-            self.conn.execute("INSERT INTO downloaded_files (hash) VALUES (?)", (file_hash,))
-        except sqlite3.IntegrityError:
-            pass
+    def add_file_hash(self, file_hash: str) -> bool:
+        """Atomically claim *file_hash*. Returns True iff it was NOT already
+        claimed — callers use this as check-and-claim in one step, so two
+        concurrent downloads of identical content can't both pass a separate
+        ``has_file_hash`` check and write duplicate files."""
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO downloaded_files (hash) VALUES (?)", (file_hash,))
+        return cur.rowcount == 1
 
     def save_queue(self, urls: Deque[str]):
         self.conn.execute("DELETE FROM queue")
@@ -82,13 +86,22 @@ class URLStore:
             return json.loads(row[0])
         return None
 
+    def save_url_list(self, kind: str, urls: Iterable[str]):
+        self.conn.execute("DELETE FROM url_lists WHERE kind=?", (kind,))
+        self.conn.executemany("INSERT OR IGNORE INTO url_lists (kind, url) VALUES (?, ?)",
+                              [(kind, u) for u in urls])
+
+    def load_url_list(self, kind: str) -> list[str]:
+        rows = self.conn.execute("SELECT url FROM url_lists WHERE kind=?", (kind,)).fetchall()
+        return [row[0] for row in rows]
+
     def clear(self):
         self.conn.execute("DELETE FROM visited")
         self.conn.execute("DELETE FROM downloaded_files")
         self.conn.execute("DELETE FROM queue")
         self.conn.execute("DELETE FROM stats")
-        self._cache.clear()
-        self._count = 0
+        self.conn.execute("DELETE FROM url_lists")
+        self._visited.clear()
 
     def close(self):
         self.conn.close()

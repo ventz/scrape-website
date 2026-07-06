@@ -15,7 +15,7 @@ both keep working.
 # Bump on every user-visible improvement/change (see CHANGELOG.md). Surfaced via
 # `--version` and logged at the start of each crawl so a run's output is traceable
 # to the code that produced it.
-__version__ = "0.5.0"
+__version__ = "0.7.0"
 
 from .config import (  # noqa: F401
     CONFIG,
@@ -27,7 +27,14 @@ from .config import (  # noqa: F401
     _DEFAULT_EXCLUDE_PATTERNS,
     _DEFAULT_TRACKING_PARAMS,
 )
-from .urls import _normalize_url, _strip_tracking_params, _url_excluded  # noqa: F401
+from .urls import (  # noqa: F401
+    _canonicalize_host,
+    _is_safe_fetch_target,
+    _normalize_url,
+    _same_host,
+    _strip_tracking_params,
+    _url_excluded,
+)
 from .sitemap import _fetch_sitemap_urls  # noqa: F401
 from .extract import (  # noqa: F401
     _extract_links_lxml,
@@ -36,6 +43,7 @@ from .extract import (  # noqa: F401
     _looks_like_spa_shell,
     _extract_document_to_markdown,
     _looks_challenged,
+    classify_page,
     is_access_denied,
 )
 from .waf import _CFSession, CF_SESSION  # noqa: F401
