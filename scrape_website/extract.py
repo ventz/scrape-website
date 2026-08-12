@@ -229,6 +229,49 @@ def _looks_like_spa_shell(html_content: str, extracted_text: str | None,
     return has_marker or wants_js or dead_end
 
 
+_PDF_MAGIC = b'%PDF'
+
+
+def _document_extension(filepath: str, url: str) -> str:
+    """Best-effort extension for *filepath*, used to pick a converter.
+
+    Resolved in order:
+
+    1. the saved file's own extension;
+    2. the extension in the URL path — covers names that lost their suffix,
+       e.g. ``/files/guide.pdf?download=1``;
+    3. PDF magic bytes.
+
+    Step 3 is what makes extension-less documents work. Drupal-backed sites
+    commonly serve files from paths with no suffix at all
+    (``/resource/proposals-dashboard-guidance`` returning
+    ``Content-Type: application/pdf``). Downloads are accepted on MIME, so such
+    a file arrives here with ``ext == ''``, matches no converter branch, and is
+    dropped without an error — it shows up under files_downloaded but never
+    under docs_extracted.
+
+    Only ``%PDF`` is sniffed, because it is unambiguous. The ZIP-based Office
+    formats (docx/xlsx/pptx/odt) all share ``PK\\x03\\x04``, so distinguishing
+    them needs archive introspection; those still rely on steps 1-2.
+    """
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in DOWNLOADABLE_EXTENSIONS:
+        return ext
+
+    url_ext = os.path.splitext(urlparse(url).path)[1].lower()
+    if url_ext in DOWNLOADABLE_EXTENSIONS:
+        return url_ext
+
+    try:
+        with open(filepath, 'rb') as fh:
+            if fh.read(len(_PDF_MAGIC)) == _PDF_MAGIC:
+                return '.pdf'
+    except OSError:
+        pass
+
+    return ext
+
+
 def _extract_document_to_markdown(filepath: str, url: str, hostname: str) -> str | None:
     """Convert a downloaded document (PDF / Office / text) to Markdown for RAG.
 
@@ -239,7 +282,7 @@ def _extract_document_to_markdown(filepath: str, url: str, hostname: str) -> str
     Runs in a worker thread — keep it import-lazy so non-document crawls pay no
     import cost.
     """
-    ext = os.path.splitext(filepath)[1].lower()
+    ext = _document_extension(filepath, url)
     body: str | None = None
     try:
         if ext == '.pdf':
