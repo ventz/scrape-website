@@ -1,6 +1,8 @@
 import pytest
 
 from scrape_website.extract import (
+    _PDF_MAGIC,
+    _document_extension,
     _extract_document_to_markdown,
     _extract_links_lxml,
     _extract_text_trafilatura,
@@ -119,3 +121,73 @@ class TestDocumentExtraction:
     def test_missing_file_returns_none(self, tmp_path):
         assert _extract_document_to_markdown(
             str(tmp_path / "nope.pdf"), "https://x.com/nope.pdf", "x.com") is None
+
+    def test_extensionless_pdf_is_detected_by_magic_bytes(self, tmp_path):
+        """A PDF served from a suffix-less path still converts.
+
+        Drupal sites serve documents from URLs like
+        /resource/proposals-dashboard-guidance with Content-Type application/pdf.
+        The download is accepted on MIME, so the saved file has no extension.
+        """
+        pymupdf = pytest.importorskip("pymupdf")
+        p = tmp_path / "proposals-dashboard-guidance"   # deliberately no suffix
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_textbox(pymupdf.Rect(72, 72, 540, 700),
+                            "Guidance text inside an extension-less PDF file.\n" * 12,
+                            fontsize=11)
+        doc.save(str(p))
+        doc.close()
+        md = _extract_document_to_markdown(
+            str(p), "https://x.com/resource/proposals-dashboard-guidance", "x.com")
+        assert md is not None
+        assert "filetype: pdf" in md
+        assert "Guidance text inside an extension-less PDF" in md
+
+    def test_extension_recovered_from_url_path(self, tmp_path):
+        """When the saved name lost its suffix, the URL path supplies it."""
+        p = tmp_path / "notes"                          # no suffix on disk
+        p.write_text("Plain text body recovered via the URL extension.")
+        md = _extract_document_to_markdown(
+            str(p), "https://x.com/files/notes.txt?download=1", "x.com")
+        assert md is not None
+        assert "filetype: txt" in md
+        assert "recovered via the URL extension" in md
+
+    def test_unknown_binary_still_returns_none(self, tmp_path):
+        """Sniffing must not turn unrecognised bytes into a bogus conversion."""
+        p = tmp_path / "mystery"
+        p.write_bytes(b"\x00\x01\x02not a document at all")
+        assert _extract_document_to_markdown(
+            str(p), "https://x.com/mystery", "x.com") is None
+
+
+class TestDocumentExtensionResolution:
+    def test_file_extension_wins(self, tmp_path):
+        p = tmp_path / "a.pdf"
+        p.write_bytes(_PDF_MAGIC + b"-1.7 rest")
+        assert _document_extension(str(p), "https://x.com/a.docx") == ".pdf"
+
+    def test_url_extension_used_when_file_has_none(self, tmp_path):
+        p = tmp_path / "a"
+        p.write_text("hello")
+        assert _document_extension(str(p), "https://x.com/files/a.csv") == ".csv"
+
+    def test_magic_bytes_are_last_resort(self, tmp_path):
+        p = tmp_path / "a"
+        p.write_bytes(_PDF_MAGIC + b"-1.4 rest")
+        assert _document_extension(str(p), "https://x.com/resource/a") == ".pdf"
+
+    def test_unknown_stays_unknown(self, tmp_path):
+        p = tmp_path / "a"
+        p.write_bytes(b"plain bytes")
+        assert _document_extension(str(p), "https://x.com/resource/a") == ""
+
+    def test_query_string_is_not_mistaken_for_an_extension(self, tmp_path):
+        p = tmp_path / "a"
+        p.write_text("hello")
+        # urlparse().path drops the query, so ".com" from a param must not leak in
+        assert _document_extension(str(p), "https://x.com/a?ref=foo.com") == ""
+
+    def test_missing_file_does_not_raise(self, tmp_path):
+        assert _document_extension(str(tmp_path / "gone"), "https://x.com/gone") == ""
