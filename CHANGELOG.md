@@ -6,6 +6,24 @@ is `__version__` in `scrape_website/__init__.py` (also `pyproject.toml`); `pytho
 app.py --version` prints it and every crawl logs it at start so output is traceable
 to the code that produced it.
 
+## [0.7.2]
+
+### Fixed
+- **Documents served from extension-less URLs are now converted to Markdown.**
+  Sites (commonly Drupal) serve files from paths like
+  `/resource/proposals-dashboard-guidance` with `Content-Type: application/pdf`.
+  They were downloaded but saved without an extension, so the extractor matched
+  no converter and dropped them silently: counted under `files_downloaded`,
+  never under `docs_extracted`. On two affected sites only 21 of ~250 PDFs were
+  converted. Reported and fixed by [@winston975](https://github.com/winston975)
+  in [#3](https://github.com/ventz/scrape-website/pull/3):
+  `_document_extension()` resolves the type from the file extension, then the
+  URL path, then `%PDF` magic bytes.
+- **Saved files take their extension from the Content-Type** when the URL path
+  has none (`guidance` → `guidance.pdf` / `.docx` / `.xlsx`). This extends the
+  fix above to Office formats, which share a ZIP signature and can't be
+  identified by magic bytes, and makes `files/` self-describing.
+
 ## [0.7.1]
 
 ### Changed

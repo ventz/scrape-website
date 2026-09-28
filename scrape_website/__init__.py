@@ -15,7 +15,7 @@ both keep working.
 # Bump on every user-visible improvement/change (see CHANGELOG.md). Surfaced via
 # `--version` and logged at the start of each crawl so a run's output is traceable
 # to the code that produced it.
-__version__ = "0.7.1"
+__version__ = "0.7.2"
 
 from .config import (  # noqa: F401
     CONFIG,

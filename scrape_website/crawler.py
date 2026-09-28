@@ -261,6 +261,14 @@ class WebsiteScraper:
                 # in '/..') is not a usable filename — fall through to the
                 # hash-based name instead of handing '..' to _reserve_path.
                 if original_name.strip('._- \t'):
+                    # Extension-less paths (/resource/guidance served as
+                    # application/pdf) take their extension from the
+                    # Content-Type, so the saved file is self-describing and
+                    # the document extractor can pick a converter for it.
+                    if os.path.splitext(original_name)[1].lower() not in DOWNLOADABLE_EXTENSIONS:
+                        ext = self.get_file_extension(url, content_type)
+                        if ext in DOWNLOADABLE_EXTENSIONS:
+                            original_name += ext
                     return original_name
         url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
         ext = self.get_file_extension(url, content_type)

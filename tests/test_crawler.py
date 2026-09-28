@@ -48,6 +48,28 @@ class TestFilenames:
         assert name not in ("..", ".")
         assert name.startswith("file_")
 
+    @pytest.mark.parametrize("ctype, expected", [
+        ("application/pdf", "guidance.pdf"),
+        ("application/pdf; charset=binary", "guidance.pdf"),
+        ("application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+         "guidance.docx"),
+        ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+         "guidance.xlsx"),
+    ])
+    def test_extensionless_path_takes_extension_from_content_type(
+            self, scraper, ctype, expected):
+        assert scraper.generate_filename(
+            "https://x.com/resource/guidance", ctype) == expected
+
+    def test_existing_extension_is_kept(self, scraper):
+        assert scraper.generate_filename(
+            "https://x.com/files/report.pdf", "application/pdf") == "report.pdf"
+
+    def test_unknown_content_type_leaves_name_alone(self, scraper):
+        assert scraper.generate_filename(
+            "https://x.com/resource/guidance", "application/octet-stream") == "guidance"
+        assert scraper.generate_filename("https://x.com/resource/guidance") == "guidance"
+
     def test_reserve_path_suffixes_within_run(self, scraper):
         p1 = scraper._reserve_path(scraper.text_dir, "page", ".md")
         p2 = scraper._reserve_path(scraper.text_dir, "page", ".md")
