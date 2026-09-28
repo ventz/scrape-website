@@ -6,6 +6,26 @@ is `__version__` in `scrape_website/__init__.py` (also `pyproject.toml`); `pytho
 app.py --version` prints it and every crawl logs it at start so output is traceable
 to the code that produced it.
 
+## [0.7.1]
+
+### Changed
+- **Default User-Agent bumped to Chrome 154** to match the current stable
+  Chrome. The cookie bridge only works when the replayed UA matches the real
+  browser that solved the challenge; override with `SCRAPE_USER_AGENT`.
+- **Dependencies upgraded** to current releases, with minimum versions raised
+  to match: trafilatura 2.2, lxml 6.1, aiohttp 3.14, playwright 1.63 (re-run
+  `uv run playwright install chromium`), curl-cffi 0.16, pymupdf4llm 1.28,
+  markitdown 0.1.8, protego 0.7, pytest 9.
+
+### Documentation
+- README rewritten as a landing page (table of contents, Quick Install, doc
+  index); detailed material moved to `docs/` (usage, protected sites, output,
+  configuration, architecture, library usage).
+- New "Does it use an LLM?" section: extraction is deterministic, with no model
+  API calls; only the optional Docling fallback runs local, non-generative
+  models.
+- Added the MIT `LICENSE` file.
+
 ## [0.7.0]
 
 ### Fixed (correctness)

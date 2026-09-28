@@ -1,7 +1,28 @@
+# Python / uv
 .venv/
 __pycache__/
 *.pyc
-data/
 *.egg-info/
-.DS_Store
+.pytest_cache/
+
+# Crawl output and scratch
+data/
 log.txt
+
+# Local / private — never commit
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+.mcp.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+private/
+.private/
+sessions/
+.sessions/
+*.session
+.DS_Store

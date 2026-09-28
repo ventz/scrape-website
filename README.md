@@ -1,342 +1,148 @@
 # scrape-website
 
-Async website scraper that crawls an entire domain and downloads all pages (HTML), extracts clean Markdown (for LLMs/RAG knowledge bases), and saves documents (PDF, DOCX, XLSX, etc.). Stays within the target domain — it will never follow links to external sites.
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+<img src="https://img.shields.io/badge/python-3.13%2B-blue.svg" alt="Python 3.13+">
 
-## Features
+Crawl an entire domain and turn it into a clean, LLM-ready knowledge base: raw
+HTML, extracted Markdown with metadata, and every linked PDF and Office
+document converted to Markdown too. Fast, polite, and able to get through
+JavaScript apps, WAFs, and bot challenges.
 
-- **Fast async crawling** — up to 100 concurrent requests (configurable)
-- **Global rate limiting** — `--delay` paces the entire crawl (default ~10 req/s crawl-wide, regardless of concurrency; `--delay 0` disables). See [Rate limiting](#rate-limiting---delay-is-a-real-global-limit-changed-in-070)
-- **JavaScript rendering (auto-escalation)** — static fetch first; when a page is detected as an un-hydrated client-rendered SPA shell (tiny text, no links), it is automatically re-fetched in headless Chromium (Playwright) and re-extracted from the hydrated DOM. Static-first by design, so only SPA pages pay the browser cost (`--render auto|never|always`)
-- **Interactive `--human` mode** — opens a **visible** browser and fetches through it, auto-pausing when it detects a Cloudflare/CAPTCHA/login challenge so you can solve it by hand; the solved session (cookies incl. `cf_clearance`) persists across pages *and across runs* via an on-disk browser profile
-- **Robust fetching** — exponential backoff with jitter, `Retry-After`-aware retries on 429/5xx, and a `curl_cffi` real-browser TLS/fingerprint fallback that retries `403`/WAF-challenge responses
-- **robots.txt politeness** — honors `robots.txt` (via `protego`) and `Crawl-Delay` (adaptive per-host rate limiting via `aiolimiter`) by default; opt out with `--ignore-robots`
-- **Document text extraction** — downloaded PDFs/Office docs are converted to RAG-ready Markdown (PyMuPDF4LLM for PDFs, MarkItDown for DOC(X)/PPT(X)/XLS(X); optional Docling fallback for complex/scanned PDFs)
-- **Async DNS** — non-blocking DNS resolution with caching (via `aiodns`)
-- **Async file I/O** — non-blocking writes with `aiofiles`
-- **Clean Markdown extraction** — extracts main content as Markdown using `trafilatura` (strips nav, headers, footers, boilerplate), with YAML front-matter metadata (title, url, hostname, sitename) at the top of each file
-- **Per-page deduplication** — repeated boilerplate is dropped only *within* a page; content that legitimately repeats across pages (e.g. an FAQ answer on both the FAQ page and its own page) is kept in full, so every page is a self-contained knowledge-base document
-- **Parallel HTML parsing** — `lxml` link extraction + text extraction offloaded to process pool (uses all CPU cores)
-- **Fast URL dedup** — visited URLs held in memory (write-through to SQLite for crash recovery), and the crawl queue itself is deduplicated, so hot-path checks never touch the database
-- **SSRF & resource-bomb hardening** — URLs sourced from crawled content (cross-host document links, sitemap-index children) are restricted to http(s) on non-internal hosts; HTML reads are capped at 50 MB decompressed, files at 100 MB (enforced before buffering), and sitemap DTDs are refused
-- **Crash recovery** — auto-resumes from checkpoint on restart (including the denied/failed/not-found report lists); use `--fresh` to start over — a fresh re-crawl overwrites the previous output with deterministic filenames instead of accumulating `_1`/`_2` duplicates
-- **Multi-domain concurrency** — all domains run in parallel via `asyncio.TaskGroup`
-- **Domain-scoped** — only follows links within the starting domain; `www.example.com` and `example.com` (and http/https variants) are treated as the same site and collapse to one canonical URL, so aliases are neither missed nor crawled twice
-- **Document downloads** — PDF, DOC(X), PPT(X), XLS(X), CSV, ZIP, RTF, ODT, ODS, ODP
-- **Multiple input modes** — single URL, file with URL list, or retry from failed URLs
-- **Page classification** — every response is classified as content / anti-bot challenge (with the vendor: Turnstile, hCaptcha, reCAPTCHA, Cloudflare interstitial) / 404 (incl. soft-404s) / access denied / search-results page; 404s and denials are counted and logged instead of being archived as content
-- **TLS escape hatch** — strict certificate verification by default; `--allow-insecure-tls` for trusted hosts with broken/expired certs
-- **Convenient short flags** — `-c`/`-t`/`-d`/`-F`/`-e`/`-n` aliases for common options
-- **Automatic retry** — URLs that fail after all retries (timeouts, persistent 429/5xx) are saved to `failed_urls.txt` and never archived as content; `--retry` force-requeues them even though a previous run already visited them
-- **Structured logging** — per-URL events logged to file, progress summaries every 5 seconds to console; the console narrates slow operations (sitemap discovery, retry waits, WAF fallbacks, browser renders) so you always know what the crawl is doing, and `-v`/`--verbose` streams every per-URL event
+## Table of Contents
 
-## Requirements
+- [Quick Install](#quick-install)
+- [Overview](#overview)
+- [Features](#features)
+- [Usage](#usage)
+- [Output](#output)
+- [How It Works](#how-it-works)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [License](#license)
 
-- Python 3.13+
-- [uv](https://docs.astral.sh/uv/) package manager
-
-## Setup
+## Quick Install
 
 ```bash
 git clone https://github.com/ventz/scrape-website.git
 cd scrape-website
 uv sync
-# One-time: download the headless browser used for JS rendering
 uv run playwright install chromium
+uv run python app.py https://example.com/
 ```
 
-> The Chromium download is only needed if you use JavaScript rendering (`--render auto` is the default). To run without a browser, pass `--render never`.
->
-> **Optional:** for complex/scanned PDFs you can install [Docling](https://github.com/docling-project/docling) (`uv add docling`); it's lazy-loaded as a fallback only when the fast PDF path yields almost nothing.
+Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/). The Chromium
+download is only needed for JavaScript rendering; skip it and pass
+`--render never` to run without a browser.
 
-## Use as a library
+## Overview
 
-Since 0.5.0 the scraper is an importable package (`scrape_website`). The tiered
-fetcher (static aiohttp → curl_cffi WAF fallback → headless-Chromium render
-escalation, with robots politeness and retry/backoff) is reusable via
-`FetchEngine`:
+Point it at a site and it crawls every same-domain page, then writes Markdown
+you can feed straight into a RAG pipeline or an LLM context window. Each page
+and document becomes a self-contained `.md` file with front matter (`title`,
+`url`, `hostname`, …), with navigation and boilerplate stripped.
 
-```python
-from scrape_website import FetchEngine
+It fetches statically first and only escalates when it needs to: headless
+Chromium for client-rendered SPAs, a real-browser TLS fingerprint for WAF
+blocks, and your own Chrome's cookies for the hardest Cloudflare walls.
+Extraction is fully deterministic, with no LLM calls (see
+[How It Works](#how-it-works)).
 
-engine = FetchEngine(render_mode="auto")
-await engine.start()
-outcome = await engine.fetch("https://example.com/")   # FetchOutcome
-await engine.close()
-```
+## Features
 
-Install with extras to pick capability tiers: `scrape-website[render,waf,docs]`
-(or `[all]`). Each tier degrades gracefully when absent. The companion
-[scrape-website-mcp](https://github.com/ventz/scrape-website-mcp) server builds
-on exactly this API. The CLI (`app.py`) is unchanged.
+- **Async and fast** — up to 100 concurrent requests, parsing spread across all CPU cores
+- **Polite by default** — global rate limit (`--delay`, ~10 req/s), `robots.txt` and `Crawl-Delay` honored
+- **JavaScript rendering** — SPA shells are detected and re-fetched in headless Chromium automatically
+- **Gets through WAFs** — `curl_cffi` browser-fingerprint fallback, plus a cookie bridge for Cloudflare Private Access Token walls
+- **Human-in-the-loop mode** — `--human` opens a visible browser and pauses for you to solve challenges or log in; sessions persist across runs
+- **Documents to Markdown** — PDF, DOC(X), PPT(X), XLS(X) and more, downloaded and extracted
+- **Page classification** — challenges, 404s (incl. soft-404s), denials, and search pages are logged, not archived as content
+- **Per-page dedup only** — content shared across pages is kept on each page, so nothing silently goes missing
+- **Crash recovery** — SQLite checkpoints every 30s; re-run to resume, `--retry` to re-fetch failures
+- **Hardened** — SSRF guard on crawled links, size caps against compression bombs, strict TLS by default
+- **Usable as a library** — the tiered `FetchEngine` is importable on its own
 
 ## Usage
 
-### Scrape a single website
-
 ```bash
+# Crawl one domain
 uv run python app.py https://example.com/
-```
 
-This crawls every page on `example.com`, saving HTML pages, extracted text, and any linked documents.
-
-### Scrape multiple websites
-
-Create a file with one URL per line:
-
-```
-# urls.txt
-# Lines starting with # are ignored, blank lines are skipped
-https://example.com/
-https://docs.example.com/
-https://blog.example.com/
-```
-
-Then run:
-
-```bash
+# Crawl many domains in parallel (one URL per line)
 uv run python app.py --file urls.txt
-```
 
-All domains run concurrently. Each domain gets its own output directory under `data/`.
-
-You can also combine a URL argument with a file:
-
-```bash
-uv run python app.py https://example.com/ --file more-urls.txt
-```
-
-### Retry failed URLs
-
-Failed URLs are automatically saved to `data/<domain>/logs/failed_urls.txt` after each run. Retry them with:
-
-```bash
+# Re-fetch URLs that failed
 uv run python app.py --retry data/example.com/logs/failed_urls.txt
-```
 
-Retry URLs are force-requeued: even though the previous run technically "visited" them (that's how they ended up in the failed list), `--retry` clears them from the visited state so they are genuinely re-fetched — without touching the rest of the crawl's state or re-crawling anything else.
-
-### Resume after crash
-
-The scraper automatically checkpoints its queue and stats to SQLite every 30 seconds. If interrupted, just re-run the same command — it will resume from where it left off.
-
-To force a clean start (ignoring any saved checkpoint):
-
-```bash
+# Start over, overwriting previous output
 uv run python app.py https://example.com/ --fresh
+
+# Gentler crawl: 20 concurrent, ~2 req/s
+uv run python app.py https://example.com/ -c 20 -d 0.5
+
+# Site behind a challenge or login
+uv run python app.py --human https://example.com/
 ```
 
-### Tuning options
+All flags are listed in the [CLI reference](docs/usage.md#cli-reference).
+
+## Output
+
+```
+data/example.com/
+  pages/   # raw HTML
+  text/    # Markdown + front matter, for pages and documents
+  files/   # downloaded PDFs, Office docs, etc.
+  logs/    # scrape.log, state.db, failed/denied/not-found/challenged reports
+```
+
+Details and a sample run are in [Output](docs/output.md).
+
+## How It Works
+
+```mermaid
+graph LR
+    A[Seed + sitemap] --> B[Queue]
+    B --> C[Static fetch]
+    C -->|SPA shell| D[Headless Chromium]
+    C -->|403 / WAF| E[Browser fingerprint<br/>+ cookie bridge]
+    C --> F[Classify + extract]
+    D --> F
+    E --> F
+    F --> G[Markdown on disk]
+```
+
+**Does it use an LLM? No.** Main-content extraction is `trafilatura`
+heuristics, documents go through `pymupdf4llm` and `markitdown` converters, and
+SPA and challenge detection are hand-written rules. There are no model API calls
+and no API keys, and crawled content never leaves your machine. "LLM" in the
+project only describes the output's audience. The optional Docling fallback
+for scanned PDFs uses local non-generative models and isn't installed by
+default. See [Architecture](docs/architecture.md#does-it-use-an-llm).
+
+## Documentation
+
+| Guide | Description |
+|---|---|
+| [Usage](docs/usage.md) | Input modes, retry/resume, rate limiting, crawl knobs, full CLI reference |
+| [Protected Sites](docs/protected-sites.md) | WAF fallback, `--human` mode, the cookie bridge for Cloudflare PAT walls |
+| [Output](docs/output.md) | Directory layout, Markdown format, deduplication |
+| [Configuration](docs/configuration.md) | Environment variables, built-in limits, install extras |
+| [Architecture](docs/architecture.md) | Pipeline, fetch tiers, extraction stack, package layout |
+| [Library Usage](docs/library.md) | Using `FetchEngine` from your own code |
+| [Changelog](CHANGELOG.md) | Release history |
+
+## Contributing
 
 ```bash
-# Throttle to 20 concurrent requests, paced to ~2 req/s crawl-wide
-uv run python app.py https://example.com/ --concurrency 20 --delay 0.5
-
-# Increase timeout for slow servers
-uv run python app.py https://example.com/ --timeout 60
-
-# All options together
-uv run python app.py https://example.com/ --concurrency 50 --timeout 60 --delay 0.25
+uv sync
+uv run pytest tests/
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--concurrency`, `-c` | `100` | Max concurrent requests |
-| `--timeout`, `-t` | `30` | Request timeout in seconds |
-| `--delay`, `-d` | `0.1` | Global request pacing: one request per this many seconds across the whole crawl (`0` disables) |
-| `--file`, `-f` | — | File with URLs to scrape (one per line) |
-| `--retry`, `-r` | — | File with failed URLs to retry |
-| `--fresh`, `-F` | — | Ignore saved checkpoint and start fresh |
-| `--fullname`, `-n` | — | Prefix output filenames with the host (`example.com_about.md`) |
-| `--verbose`, `-v` | — | Show per-URL activity on the console (fetches, saves, fallbacks, errors); full detail always goes to `logs/scrape.log` |
-| `--render` | `auto` | JS rendering: `auto` (only SPA shells), `always` (every page), `never` (disable) |
-| `--human` | — | Open a visible browser, fetch through it, and pause for you to solve challenges/logins (forces `--concurrency 1`) |
-| `--allow-insecure-tls` | — | Disable TLS certificate verification (trusted hosts with broken certs) |
-| `--ignore-robots` | — | Do not fetch or honor `robots.txt` |
-| `--no-extract-docs` | — | Do not convert downloaded PDFs/Office docs to Markdown |
-| `--exclude-pattern`, `-e` | see below | Regex to exclude URLs (repeatable; appends to defaults) |
-| `--no-default-excludes` | — | Clear built-in exclude patterns (only use `--exclude-pattern` values) |
-| `--no-strip-tracking-params` | — | Keep tracking query params (`utm_*`, `fbclid`, etc.) |
-| `--no-use-sitemap` | — | Skip sitemap.xml discovery for seed URLs |
-
-### JavaScript-rendered (SPA) sites
-
-Many modern sites (React/Next.js, Vue/Nuxt, Angular, etc.) ship a near-empty HTML shell and render content client-side. A static fetch of such a page yields almost no text and no followable links. By default (`--render auto`) the scraper detects these shells and transparently re-fetches them in headless Chromium, then extracts from the hydrated DOM:
-
-```bash
-# Default: auto-escalate only the pages that need it
-uv run python app.py https://example.com/
-
-# Force a browser render for every page (slower; for fully dynamic sites)
-uv run python app.py https://example.com/ --render always
-
-# Disable rendering entirely (no browser needed)
-uv run python app.py https://example.com/ --render never
-```
-
-### Cloudflare / CAPTCHA / login walls (`--human`)
-
-Some sites sit behind a bot challenge (Cloudflare "Just a moment…", a CAPTCHA/Turnstile/hCaptcha gate) or a login wall that a headless crawler can't get past. `--human` handles these by putting **you** in the loop:
-
-```bash
-python app.py --human "https://example.com/"
-```
-
-What it does:
-
-- Opens a **real, visible Chromium window** and fetches every page through it — so requests carry a genuine browser fingerprint (the only reliable way to reuse a solved Cloudflare `cf_clearance` cookie).
-- **Crawls normally until it hits a genuine challenge.** When it detects a Cloudflare interstitial, Turnstile/hCaptcha/reCAPTCHA, or login page, it brings the window to the front and pauses with a prompt in your terminal that names what was detected. You solve it in the browser, press **Enter**, and the crawl continues — now carrying the cleared session. Pages that merely *look* blocked but have nothing to solve — a 404/soft-404, a plain 403, a search-results page — are classified as such and never pause the crawl (404s go to `logs/not_found.txt`, denials to `logs/access_denied.txt`).
-- **Remembers the session.** The browser profile is saved under `data/<domain>/logs/browser_profile/`, so a session you solve (or a login you complete) persists across pages and is reused on future runs — solve once, crawl for days.
-- Forces `--concurrency 1` so there's a single window and an unambiguous prompt.
-
-> Requires the Chromium binary (`uv run playwright install chromium`). This mode is slower than the static path (a browser page per URL) — reach for it only when a site actually gates you.
-
-#### Modern Cloudflare (Private Access Token) walls — the cf-clearance bridge
-
-Some Cloudflare sites use a **Private Access Token (PAT)** challenge that **no automated browser — even the visible Playwright window above — can ever pass**. A PAT is hardware-attested (Secure Enclave); only a genuine, OS-blessed browser (your real Chrome/Safari) can mint it. For these, the scraper **reuses the `cf_clearance` cookie your real Chrome earned** and replays it with a matched Chrome TLS fingerprint + User-Agent (the cookie is bound to domain + IP + UA). Cookie sources, tried in order:
-
-1. **`SCRAPE_CF_COOKIES`** (or `IB_CF_COOKIES`) — an exported cookies file (JSON `[{"domain","name":"cf_clearance","value"}]` or Netscape `cookies.txt`). Most reliable, needs **no browser and no `--human`**:
-   ```bash
-   SCRAPE_CF_COOKIES=~/cf.json python app.py "https://protected.example/"
-   ```
-2. **Your live Chrome cookie store** via `browser_cookie3` (silent; optional dep — degrades gracefully if it can't decrypt the newest Chrome).
-3. **`--human` only** — opens the URL as a tab in your **real Chrome** (`open -a`, macOS), you solve it once, and it polls until `cf_clearance` appears. Under `--human`, this also kicks in automatically when a manual Playwright solve leaves the page *still* challenged (the PAT case).
-
-Solve **once per host** — the cookie is cached for the rest of the run. The default User-Agent is Chrome 148; keep it matched to your installed Chrome (override `SCRAPE_USER_AGENT`). Other env vars: `SCRAPE_REAL_BROWSER` (default "Google Chrome"), `SCRAPE_HUMAN_SOLVE_TIMEOUT` (default 300s).
-
-### Politeness & robots.txt
-
-`robots.txt` is honored by default, and any `Crawl-Delay` it declares becomes an adaptive per-host rate limit. Disable with `--ignore-robots` (use responsibly):
-
-```bash
-uv run python app.py https://example.com/ --ignore-robots
-```
-
-#### Rate limiting: `--delay` is a real, global limit (changed in 0.7.0)
-
-`--delay` paces the **whole crawl**: one request per `--delay` seconds *across all concurrent tasks*, regardless of `--concurrency`. The default of `0.1` means the crawler never exceeds ~10 requests/second against the target site.
-
-> **Behavior change (0.7.0):** in earlier versions each task slept independently, so at the default concurrency of 100 the delay throttled essentially nothing — crawls ran at whatever rate the site could absorb. The delay now does what it always claimed to. This makes default crawls **politer and slower** than before.
-
-```bash
-# Default: ~10 req/s crawl-wide (0.1s between requests)
-uv run python app.py https://example.com/
-
-# Gentler: ~2 req/s
-uv run python app.py https://example.com/ --delay 0.5
-
-# Old full-speed behavior: disable pacing entirely (only concurrency limits apply)
-uv run python app.py https://example.com/ --delay 0
-```
-
-When robots.txt declares a `Crawl-Delay`, that takes precedence over `--delay` for the run.
-
-### Hard / misconfigured sites
-
-```bash
-# Trusted host with a broken or expired TLS certificate
-uv run python app.py https://example.com/ --allow-insecure-tls
-```
-
-`401`/`403`/WAF-challenge responses (and 200 "Just a moment…" Cloudflare interstitials) are automatically retried with a real-browser TLS fingerprint (`curl_cffi`), escalating to the [cf-clearance bridge](#modern-cloudflare-private-access-token-walls--the-cf-clearance-bridge) when a `cf_clearance` cookie is available, before being recorded as failures.
-
-### Crawl-quality knobs
-
-Three features are **on by default** and improve crawl quality on most sites:
-
-**URL exclude patterns** — skip URLs matching common noise patterns (tag pages, author archives, pagination, print views, etc.):
-
-```bash
-# Add a custom exclude pattern (appended to defaults)
-uv run python app.py https://blog.example.com/ --exclude-pattern '/category/'
-
-# Use only your own patterns (no defaults)
-uv run python app.py https://blog.example.com/ --no-default-excludes --exclude-pattern '/archive/'
-```
-
-Default patterns: `/tag/`, `/author/`, `/feed/`, `/print/`, `?print=`, `/comments/`, `/page/\d+`, `/cdn-cgi/`.
-
-**Tracking-param stripping** — removes `utm_source`, `fbclid`, `gclid`, and similar query params so the same page isn't scraped twice with different tracking links:
-
-```bash
-# Opt out (keep all query params as-is)
-uv run python app.py https://example.com/ --no-strip-tracking-params
-```
-
-**Sitemap seeding** — fetches `sitemap.xml` (and sitemap index files) to discover pages that might not be linked from the homepage:
-
-```bash
-# Opt out
-uv run python app.py https://example.com/ --no-use-sitemap
-```
-
-## Output structure
-
-```
-data/
-  example.com/
-    pages/              # Raw HTML files
-    text/               # Clean extracted Markdown (.md) w/ metadata — LLM-ready
-    files/              # Downloaded documents (PDF, DOCX, etc.)
-    logs/
-      scrape.log        # Full debug log
-      state.db          # SQLite DB (visited URLs, queue, stats, report lists)
-      access_denied.txt # URLs that returned 401/403 (if any)
-      failed_urls.txt   # URLs that failed after retries (if any) — feed to --retry
-      not_found.txt     # 404/410 + soft-404 URLs (if any)
-      challenged_urls.txt # URLs still blocked by an anti-bot challenge (if any)
-  docs.example.com/
-    pages/
-    text/
-    files/
-    logs/
-```
-
-Each domain is stored separately, so scraping multiple sites keeps everything organized.
-
-The `text/` directory contains clean, extracted main content as Markdown (`.md`) — ideal for feeding into LLMs, RAG pipelines, or text analysis. Navigation, headers, footers, and boilerplate are stripped by `trafilatura`. Each file opens with a YAML front-matter block (`title`, `url`, `hostname`, `sitename`) for provenance and better retrieval, followed by the page content with headings and links preserved. Downloaded documents (PDF, DOC(X), etc.) are also extracted to `.md` here, with their own front matter (`title`, `url`, `hostname`, `filetype`, `date`), so the whole corpus — pages and documents alike — is uniform Markdown.
-
-Deduplication is **per-page only**: `trafilatura`'s repetition cache is reset before every page, so a passage is removed only if it repeats within that same page. Text that legitimately appears on multiple pages (a shared FAQ answer, a reused policy blurb) is retained in full on every page — there is no cross-page/cross-domain content loss, which would otherwise leave some pages with a truncated file or no file at all.
-
-## Example
-
-```
-% python app.py 'https://privsec.harvard.edu'
-Output directory: data/privsec.harvard.edu
-Starting domain: privsec.harvard.edu
-Max concurrent requests: 100
-Mode: render=auto
-Tip: per-URL detail is in data/privsec.harvard.edu/logs/scrape.log (or run with --verbose)
-Starting scraper at 2026-03-12 14:01:58
-scrape-website v0.7.0 — crawling privsec.harvard.edu
-Checking sitemap.xml for seed URLs...
-Sitemap: seeded 87 URLs from sitemap.xml
-Progress: 42 visited | 39 pages | 36 text | 0 rendered | 1 files | 1 docs | 2 denied | 0 404s | 0 errors | 1.9 MB | 55 queued
-
-================================================================================
-SCRAPING COMPLETED
-================================================================================
-Duration: 14.20 seconds
-URLs visited: 104
-Pages downloaded: 98
-Text extracted: 91
-Pages rendered (JS): 0
-Files downloaded: 3
-Documents extracted: 3
-Access denied: 3
-Not found (404): 2
-Blocked by challenge: 0
-Skipped (robots.txt): 0
-Total data: 4.63 MB
-Errors: 0
-Output location: data/privsec.harvard.edu
-Denied URLs logged to: data/privsec.harvard.edu/logs/access_denied.txt
-Not-found URLs logged to: data/privsec.harvard.edu/logs/not_found.txt
-================================================================================
-
-% ls data/privsec.harvard.edu/
-files/  logs/  pages/  text/
-```
+The suite includes an end-to-end crawl against a local fixture server, so it
+never touches the network. Bump `__version__` in `scrape_website/__init__.py`
+and `pyproject.toml` together, and add a [CHANGELOG](CHANGELOG.md) entry for
+user-visible changes.
 
 ## License
 
-MIT
+[MIT](LICENSE) © Ventz Petkov
