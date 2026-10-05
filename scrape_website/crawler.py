@@ -478,12 +478,13 @@ class WebsiteScraper:
     def _sitemap_fallback(self, url: str, loop) -> bytes | None:
         """Sitemap 401/403 fallback, called from the sitemap worker thread: run the
         engine's curl_cffi fingerprint fallback (no cookie bridge) on the crawl's
-        event loop and return the body bytes, or None if it is still blocked."""
+        event loop and return the raw body bytes (so the XML declaration's encoding
+        is honored by the parser), or None if it is still blocked."""
         self.logger.info(
             f"Sitemap blocked at {url} — trying Chrome-fingerprint fallback (curl_cffi)")
         try:
             result = asyncio.run_coroutine_threadsafe(
-                self.engine._fetch_via_curl_cffi(url, cookie_bridge=False),
+                self.engine._fetch_via_curl_cffi(url, cookie_bridge=False, raw=True),
                 loop).result()
         except Exception as e:
             self.logger.debug(f"curl_cffi sitemap fallback failed for {url}: {e}")

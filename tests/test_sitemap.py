@@ -130,6 +130,13 @@ def test_403_uses_fallback():
     assert calls == ["https://x.com/sitemap.xml", "https://x.com/sitemap_index.xml"]
 
 
+def test_fallback_exception_returns_empty():
+    def fallback(url):
+        raise RuntimeError("fallback blew up")
+    with patch.object(sitemap, "urlopen", _urlopen_403):
+        assert sitemap._fetch_sitemap_urls("x.com", fallback=fallback) == []
+
+
 def test_403_without_fallback_returns_empty():
     with patch.object(sitemap, "urlopen", _urlopen_403):
         assert sitemap._fetch_sitemap_urls("x.com") == []

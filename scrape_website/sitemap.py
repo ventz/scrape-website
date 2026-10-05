@@ -52,7 +52,12 @@ def _fetch_sitemap_urls(host: str, scheme: str = "https",
         except HTTPError as e:
             if fallback is None or e.code not in (401, 403):
                 return None
-            data = fallback(url)
+            # The fallback is caller-supplied; any error from it is a
+            # failed fetch like any other, never an exception out of here.
+            try:
+                data = fallback(url)
+            except Exception:
+                return None
             if data is None:
                 return None
         except Exception:

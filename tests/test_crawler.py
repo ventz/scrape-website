@@ -106,6 +106,30 @@ class TestSitemapCurlFallback:
         assert seen[0][0] == "https://x.com/sitemap.xml"
         assert all("Cookie" not in h for _, h in seen)
 
+    async def test_non_utf8_sitemap_keeps_declared_encoding(self, scraper, monkeypatch):
+        """The fallback hands the parser raw bytes, so an ISO-8859-1 sitemap
+        is decoded per its XML declaration rather than garbled via .text."""
+        import asyncio
+        from unittest.mock import patch
+
+        from scrape_website import sitemap
+        from test_fetch_engine import forbid_cookie_reads, patch_curl_cffi
+        from test_sitemap import _urlopen_403
+
+        latin1 = ('<?xml version="1.0" encoding="ISO-8859-1"?>\n'
+                  '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                  '<url><loc>https://x.com/caf\u00e9</loc></url></urlset>'
+                  ).encode("iso-8859-1")
+        forbid_cookie_reads(monkeypatch)
+        patch_curl_cffi(monkeypatch, {
+            "https://x.com/sitemap.xml": (200, latin1, "application/xml"),
+        })
+        loop = asyncio.get_running_loop()
+        with patch.object(sitemap, "urlopen", _urlopen_403):
+            urls = await loop.run_in_executor(None, lambda: sitemap._fetch_sitemap_urls(
+                "x.com", fallback=lambda u: scraper._sitemap_fallback(u, loop)))
+        assert urls == ["https://x.com/caf\u00e9"]
+
     async def test_still_blocked_returns_none_and_warns(self, scraper, monkeypatch, caplog):
         import asyncio
 

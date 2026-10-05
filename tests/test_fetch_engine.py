@@ -329,7 +329,9 @@ class _FakeCurlResponse:
     def __init__(self, status, body, ctype):
         self.status_code = status
         self.content = body
-        self.text = body.decode("utf-8")
+        # Like curl_cffi, .text decodes with a guessed charset; garbles
+        # non-UTF-8 bytes (which is why sitemaps must use .content).
+        self.text = body.decode("utf-8", errors="replace")
         self.headers = {"Content-Type": ctype}
 
 
@@ -404,3 +406,39 @@ class TestRobotsCurlFallback:
         assert engine._robots is None
         assert engine.robots_allows("https://x.com/private/a") is True
         assert "WITHOUT robots.txt enforcement" in caplog.text
+        assert "curl_cffi got HTTP 403 with an HTML body" in caplog.text
+
+    async def test_curl_404_is_not_a_warning(self, monkeypatch, caplog):
+        """Past the WAF there is simply no robots.txt: INFO, no warning."""
+        forbid_cookie_reads(monkeypatch)
+        patch_curl_cffi(monkeypatch, {})  # unrouted -> 404
+        engine = make_engine([FakeResponse(status=403, body=b"Access Denied")])
+        with caplog.at_level("INFO", logger=engine.logger.name):
+            await engine.load_robots("https://x.com/")
+        assert engine._robots is None
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+        assert "No robots.txt at https://x.com/robots.txt (HTTP 404" in caplog.text
+
+    async def test_html_body_reason(self, monkeypatch, caplog):
+        forbid_cookie_reads(monkeypatch)
+        patch_curl_cffi(monkeypatch, {
+            "https://x.com/robots.txt": (200, b"<html>app shell</html>", "text/html"),
+        })
+        engine = make_engine([FakeResponse(status=403, body=b"Access Denied")])
+        with caplog.at_level("WARNING", logger=engine.logger.name):
+            await engine.load_robots("https://x.com/")
+        assert engine._robots is None
+        assert "curl_cffi got HTTP 200 with an HTML body" in caplog.text
+
+    async def test_curl_not_installed_reason(self, monkeypatch, caplog):
+        import importlib.util
+        import sys
+        monkeypatch.setitem(sys.modules, "curl_cffi.requests", None)
+        real_find_spec = importlib.util.find_spec
+        monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: (
+            None if name == "curl_cffi" else real_find_spec(name, *a)))
+        engine = make_engine([FakeResponse(status=403, body=b"Access Denied")])
+        with caplog.at_level("WARNING", logger=engine.logger.name):
+            await engine.load_robots("https://x.com/")
+        assert engine._robots is None
+        assert "curl_cffi is not installed" in caplog.text

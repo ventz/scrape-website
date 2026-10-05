@@ -390,13 +390,16 @@ class FetchEngine:
     # ------------------------------------------------------------------
     # curl_cffi browser-impersonation fallback (for 403 / WAF challenges)
     # ------------------------------------------------------------------
-    async def _curl_get(self, url: str, replay_cookies: bool = True) -> tuple | None:
+    async def _curl_get(self, url: str, replay_cookies: bool = True,
+                        raw: bool = False) -> tuple | None:
         """One curl_cffi GET impersonating Chrome, replaying ALL cached cookies for
         this host (Cloudflare/Imperva/Akamai clearance + any login session) with the
         MATCHED User-Agent. Returns a fetch tuple, or None on transport error / missing
         dep. The caller decides if a 403/challenge response is worth escalating to the
         cookie bridge. ``replay_cookies=False`` sends no cookies at all (and never
-        touches the cookie cache/file) — the fingerprint alone."""
+        touches the cookie cache/file) — the fingerprint alone. ``raw=True`` returns
+        an 'html' body as undecoded bytes, so XML can honor its own encoding
+        declaration (sitemaps)."""
         try:
             from curl_cffi.requests import AsyncSession
         except ImportError:
@@ -429,7 +432,7 @@ class FetchEngine:
                 if len(resp.content) > self.max_page_size:
                     self.logger.info(f"Page exceeded size cap (curl_cffi): {url}")
                     return None
-                return resp.text, content_type, 'html', status
+                return (resp.content if raw else resp.text), content_type, 'html', status
         except Exception as e:
             self.logger.debug(f"curl_cffi fetch failed for {url}: {e}")
             return None
@@ -442,12 +445,14 @@ class FetchEngine:
         content, _ctype, kind, status = result
         if status == 403 or status >= 500:
             return True
+        if isinstance(content, bytes):
+            content = content.decode('utf-8', errors='replace')
         if kind == 'html' and classify_page(content, status)[0] == 'challenge':
             return True
         return False
 
-    async def _fetch_via_curl_cffi(self, url: str,
-                                   cookie_bridge: bool = True) -> tuple | None:
+    async def _fetch_via_curl_cffi(self, url: str, cookie_bridge: bool = True,
+                                   raw: bool = False) -> tuple | None:
         """Real-browser-fingerprint fallback for 403 / WAF / Cloudflare challenges.
 
         aiohttp's TLS/HTTP2 fingerprint is increasingly fingerprint-blocked by WAFs
@@ -461,8 +466,9 @@ class FetchEngine:
         ``cookie_bridge=False`` stops after the fingerprint-only attempt: no cookie
         replay, no cookie file / Chrome cookie store reads, no real-Chrome tab. Used
         for robots.txt and sitemap.xml, which must never trigger cookie reads.
+        ``raw=True`` keeps an 'html' body as bytes (see ``_curl_get``).
         """
-        result = await self._curl_get(url, replay_cookies=cookie_bridge)
+        result = await self._curl_get(url, replay_cookies=cookie_bridge, raw=raw)
         if not self._curl_blocked(result):
             return result
         if not cookie_bridge:
@@ -478,7 +484,7 @@ class FetchEngine:
             if not got:
                 return None
             self.logger.info("cf-clearance obtained; replaying %s via curl_cffi", url)
-        replay = await self._curl_get(url)
+        replay = await self._curl_get(url, raw=raw)
         return None if self._curl_blocked(replay) else replay
 
     def _backoff(self, attempt: int) -> float:
@@ -640,6 +646,7 @@ class FetchEngine:
         parsed = urlparse(base_url)
         robots_url = f"{parsed.scheme or 'https'}://{parsed.netloc}/robots.txt"
         blocked_status = None
+        fallback = None
         try:
             from protego import Protego
             async with self.session.get(robots_url, allow_redirects=True) as resp:
@@ -656,13 +663,21 @@ class FetchEngine:
                 self.logger.info(
                     f"HTTP {status} for {robots_url} — trying Chrome-fingerprint "
                     f"fallback (curl_cffi)")
-                fallback = await self._fetch_via_curl_cffi(
-                    robots_url, cookie_bridge=False)
-                if fallback is not None:
+                # Same as _fetch_via_curl_cffi(cookie_bridge=False), but keeps
+                # a still-blocked result so the warning below can say why.
+                fallback = await self._curl_get(robots_url, replay_cookies=False)
+                if fallback is not None and not self._curl_blocked(fallback):
                     content, fctype, _kind, status = fallback
-                    ctype = (fctype or '').lower()
-                    body = (content.decode('utf-8', errors='replace')
-                            if isinstance(content, bytes) else content)
+                    if status in (404, 410):
+                        # Past the WAF, and the site simply has no robots.txt.
+                        blocked_status = None
+                        self.logger.info(
+                            f"No robots.txt at {robots_url} "
+                            f"(HTTP {status} via curl_cffi)")
+                    else:
+                        ctype = (fctype or '').lower()
+                        body = (content.decode('utf-8', errors='replace')
+                                if isinstance(content, bytes) else content)
             # Some SPA/CMS hosts serve their HTML app shell (status 200) for
             # a missing /robots.txt — don't parse that as rules.
             if status == 200 and 'html' not in ctype:
@@ -678,8 +693,9 @@ class FetchEngine:
         if blocked_status is not None and self._robots is None:
             self.logger.warning(
                 f"robots.txt at {robots_url} is blocked (HTTP {blocked_status}) "
-                f"and the curl_cffi fallback did not get it — proceeding WITHOUT "
-                f"robots.txt enforcement")
+                f"and the curl_cffi fallback did not get it "
+                f"({self._robots_fallback_reason(fallback)}) — proceeding "
+                f"WITHOUT robots.txt enforcement")
 
         if self._robots is not None:
             try:
@@ -691,6 +707,24 @@ class FetchEngine:
                 from aiolimiter import AsyncLimiter
                 self._rate_limiter = AsyncLimiter(1, float(delay))
                 self.logger.info(f"robots.txt Crawl-Delay: pacing to 1 request / {delay}s")
+
+    @staticmethod
+    def _robots_fallback_reason(result: tuple | None) -> str:
+        """Why the robots.txt curl_cffi fallback produced no rules."""
+        if result is None:
+            import importlib.util
+            if importlib.util.find_spec('curl_cffi') is None:
+                return "curl_cffi is not installed"
+            return "curl_cffi request failed"
+        content, ctype, _kind, status = result
+        if isinstance(content, bytes):
+            content = content.decode('utf-8', errors='replace')
+        kind, detail = classify_page(content, status)
+        if kind == 'challenge':
+            return f"curl_cffi got HTTP {status}, {detail or 'challenge page'}"
+        if 'html' in (ctype or '').lower():
+            return f"curl_cffi got HTTP {status} with an HTML body"
+        return f"curl_cffi got HTTP {status}"
 
     def robots_allows(self, url: str) -> bool:
         if not self.respect_robots or self._robots is None:
