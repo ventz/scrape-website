@@ -22,6 +22,11 @@ the URL as failed. An interstitial is never archived as content.
 cookie bridge: they don't read your browser's cookies. If `robots.txt` is still
 blocked, the crawl logs a warning and proceeds without robots.txt enforcement.
 
+The fallback only works when the User-Agent matches the Chrome fingerprint.
+Akamai checks both, so a custom non-Chrome `SCRAPE_USER_AGENT` still gets a
+`403` through `curl_cffi`. Keep the default Chrome User-Agent on WAF-protected
+sites.
+
 ## Interactive mode (`--human`)
 
 For Cloudflare challenges, Turnstile / hCaptcha / reCAPTCHA gates, or login walls:
