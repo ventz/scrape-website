@@ -81,3 +81,43 @@ class TestFilenames:
         stale.write_text("old run")
         p = scraper._reserve_path(scraper.text_dir, "page", ".md")
         assert p == stale  # fresh run reclaims the name instead of page_1.md
+
+
+class TestSitemapCurlFallback:
+    async def test_403_falls_back_to_curl_cffi(self, scraper, monkeypatch):
+        """urllib 403 on sitemap.xml -> the crawler's bridge runs the engine's
+        curl_cffi fallback (no cookie bridge) and the sitemap still seeds."""
+        import asyncio
+        from unittest.mock import patch
+
+        from scrape_website import sitemap
+        from test_fetch_engine import forbid_cookie_reads, patch_curl_cffi
+        from test_sitemap import SITEMAP_PLAIN, _urlopen_403
+
+        forbid_cookie_reads(monkeypatch)
+        seen = patch_curl_cffi(monkeypatch, {
+            "https://x.com/sitemap.xml": (200, SITEMAP_PLAIN, "application/xml"),
+        })
+        loop = asyncio.get_running_loop()
+        with patch.object(sitemap, "urlopen", _urlopen_403):
+            urls = await loop.run_in_executor(None, lambda: sitemap._fetch_sitemap_urls(
+                "x.com", fallback=lambda u: scraper._sitemap_fallback(u, loop)))
+        assert urls == ["https://x.com/a", "https://x.com/b"]
+        assert seen[0][0] == "https://x.com/sitemap.xml"
+        assert all("Cookie" not in h for _, h in seen)
+
+    async def test_still_blocked_returns_none_and_warns(self, scraper, monkeypatch, caplog):
+        import asyncio
+
+        from test_fetch_engine import forbid_cookie_reads, patch_curl_cffi
+
+        forbid_cookie_reads(monkeypatch)
+        patch_curl_cffi(monkeypatch, {
+            "https://x.com/sitemap.xml": (403, b"Access Denied", "text/html"),
+        })
+        loop = asyncio.get_running_loop()
+        with caplog.at_level("WARNING"):
+            data = await loop.run_in_executor(
+                None, scraper._sitemap_fallback, "https://x.com/sitemap.xml", loop)
+        assert data is None
+        assert "is blocked and the curl_cffi fallback did not get it" in caplog.text

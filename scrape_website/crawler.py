@@ -475,6 +475,30 @@ class WebsiteScraper:
             self._save_checkpoint()
             self.logger.debug(f"Checkpoint saved: {len(self.urls_to_visit)} URLs in queue")
 
+    def _sitemap_fallback(self, url: str, loop) -> bytes | None:
+        """Sitemap 401/403 fallback, called from the sitemap worker thread: run the
+        engine's curl_cffi fingerprint fallback (no cookie bridge) on the crawl's
+        event loop and return the body bytes, or None if it is still blocked."""
+        self.logger.info(
+            f"Sitemap blocked at {url} — trying Chrome-fingerprint fallback (curl_cffi)")
+        try:
+            result = asyncio.run_coroutine_threadsafe(
+                self.engine._fetch_via_curl_cffi(url, cookie_bridge=False),
+                loop).result()
+        except Exception as e:
+            self.logger.debug(f"curl_cffi sitemap fallback failed for {url}: {e}")
+            result = None
+        if result is None:
+            self.logger.warning(
+                f"Sitemap at {url} is blocked and the curl_cffi fallback did not "
+                f"get it — skipping it")
+            return None
+        if result[3] != 200:
+            self.logger.debug(f"No sitemap at {url} (HTTP {result[3]} via curl_cffi)")
+            return None
+        content = result[0]
+        return content.encode('utf-8') if isinstance(content, str) else content
+
     async def crawl(self):
         from . import __version__
         self.logger.info("scrape-website v%s — crawling %s", __version__, self.base_domain)
@@ -499,6 +523,7 @@ class WebsiteScraper:
                 None, lambda: _fetch_sitemap_urls(
                     self.base_domain, scheme=parsed_start.scheme or "https",
                     allow_insecure_tls=self.allow_insecure_tls,
+                    fallback=lambda u: self._sitemap_fallback(u, loop),
                 ))
             if sitemap_urls:
                 added = 0

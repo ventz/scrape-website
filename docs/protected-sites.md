@@ -18,6 +18,10 @@ real Chrome TLS fingerprint. If that's still blocked, the scraper tries the
 [cookie bridge](#the-cookie-bridge-private-access-token-walls) before recording
 the URL as failed. An interstitial is never archived as content.
 
+`robots.txt` and `sitemap.xml` get the same `curl_cffi` retry, but never the
+cookie bridge: they don't read your browser's cookies. If `robots.txt` is still
+blocked, the crawl logs a warning and proceeds without robots.txt enforcement.
+
 ## Interactive mode (`--human`)
 
 For Cloudflare challenges, Turnstile / hCaptcha / reCAPTCHA gates, or login walls:

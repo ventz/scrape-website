@@ -16,6 +16,9 @@ class FakeResponse:
     async def read(self):
         return self._body
 
+    async def text(self):
+        return self._body.decode(self.charset or "utf-8")
+
     @property
     def content(self):
         body = self._body
@@ -56,6 +59,9 @@ class FakeSession:
             async def __aexit__(self_inner, *a):
                 return False
         return _CM()
+
+    def get(self, url, allow_redirects=True):
+        return self.request("GET", url, allow_redirects=allow_redirects)
 
     async def close(self):
         self.closed = True
@@ -314,3 +320,87 @@ class TestRobots:
         await asyncio.gather(*(engine.wait_politeness() for _ in range(4)))
         elapsed = loop.time() - start
         assert elapsed >= 0.05 * 3 * 0.9  # 4 requests -> >= ~3 gaps
+
+
+# ----------------------------------------------------------------------
+# robots.txt / sitemap.xml: aiohttp/urllib 403 -> curl_cffi fallback
+# ----------------------------------------------------------------------
+class _FakeCurlResponse:
+    def __init__(self, status, body, ctype):
+        self.status_code = status
+        self.content = body
+        self.text = body.decode("utf-8")
+        self.headers = {"Content-Type": ctype}
+
+
+def patch_curl_cffi(monkeypatch, routes):
+    """Replace curl_cffi's AsyncSession with one serving ``routes``
+    (url -> (status, body, content-type)). Returns the list of (url, headers)
+    requests it saw."""
+    import curl_cffi.requests
+    seen = []
+
+    class _FakeAsyncSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, impersonate=None, headers=None, **kw):
+            assert impersonate == "chrome"
+            seen.append((url, dict(headers or {})))
+            status, body, ctype = routes.get(url, (404, b"not found", "text/plain"))
+            return _FakeCurlResponse(status, body, ctype)
+
+    monkeypatch.setattr(curl_cffi.requests, "AsyncSession", _FakeAsyncSession)
+    return seen
+
+
+def forbid_cookie_reads(monkeypatch):
+    """robots/sitemap fallbacks must never touch the cookie bridge."""
+    from scrape_website import waf
+
+    def boom(*a, **k):
+        raise AssertionError("cookie bridge consulted for robots/sitemap")
+    for name in ("cookie_header_for", "has_clearance_for", "obtain_clearance",
+                 "_load_manual_once"):
+        monkeypatch.setattr(waf.CF_SESSION, name, boom)
+
+
+ROBOTS_BODY = b"User-agent: *\nDisallow: /private/\nCrawl-delay: 2\n"
+
+
+class TestRobotsCurlFallback:
+    async def test_403_falls_back_to_curl_cffi(self, monkeypatch):
+        forbid_cookie_reads(monkeypatch)
+        seen = patch_curl_cffi(monkeypatch, {
+            "https://x.com/robots.txt": (200, ROBOTS_BODY, "text/plain"),
+        })
+        engine = make_engine([FakeResponse(status=403, body=b"Access Denied")])
+        await engine.load_robots("https://x.com/")
+        assert [u for u, _ in seen] == ["https://x.com/robots.txt"]
+        assert "Cookie" not in seen[0][1]
+        assert engine.robots_allows("https://x.com/private/a") is False
+        assert engine.robots_allows("https://x.com/public") is True
+        assert engine._rate_limiter is not None  # Crawl-delay picked up
+
+    async def test_200_does_not_use_curl_cffi(self, monkeypatch):
+        seen = patch_curl_cffi(monkeypatch, {})
+        engine = make_engine([FakeResponse(
+            body=ROBOTS_BODY, headers={"Content-Type": "text/plain"})])
+        await engine.load_robots("https://x.com/")
+        assert seen == []
+        assert engine.robots_allows("https://x.com/private/a") is False
+
+    async def test_still_blocked_warns_and_proceeds(self, monkeypatch, caplog):
+        forbid_cookie_reads(monkeypatch)
+        patch_curl_cffi(monkeypatch, {
+            "https://x.com/robots.txt": (403, b"Access Denied", "text/html"),
+        })
+        engine = make_engine([FakeResponse(status=403, body=b"Access Denied")])
+        with caplog.at_level("WARNING", logger=engine.logger.name):
+            await engine.load_robots("https://x.com/")
+        assert engine._robots is None
+        assert engine.robots_allows("https://x.com/private/a") is True
+        assert "WITHOUT robots.txt enforcement" in caplog.text

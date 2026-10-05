@@ -70,7 +70,9 @@ uv run python app.py https://example.com/ --delay 0     # no pacing; concurrency
 
 `robots.txt` is honored by default (via `protego`). A `Crawl-Delay` it declares
 takes precedence over `--delay`. Opt out with `--ignore-robots`, and use it
-responsibly.
+responsibly. A WAF-blocked `robots.txt` is retried through the
+[`curl_cffi` fallback](protected-sites.md#automatic-waf-fallback); if it still
+can't be fetched, the crawl warns and runs without robots.txt rules.
 
 ## Crawl-quality knobs
 

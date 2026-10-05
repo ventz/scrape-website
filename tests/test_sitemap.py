@@ -63,12 +63,9 @@ def test_sitemap_index_recursion_and_dedup():
             "https://x.com/sub1.xml": SUB1,
             "https://x.com/sub2.xml": SUB2})):
         urls = sitemap._fetch_sitemap_urls("x.com")
-    # Sub-sitemap pages come first, deduped across sub-sitemaps. The
-    # namespace-stripped fallback in _parse_locs then also surfaces the
-    # index's own <sitemap><loc> entries — long-standing upstream behavior
-    # (harmless: the .xml seeds fetch nothing useful), kept for parity.
-    assert urls[:2] == ["https://x.com/one", "https://x.com/two"]
-    assert set(urls[2:]) == {"https://x.com/sub1.xml", "https://x.com/sub2.xml"}
+    # Sub-sitemap pages, deduped across sub-sitemaps. The index's own
+    # <sitemap><loc> entries are NOT seeded as pages.
+    assert urls == ["https://x.com/one", "https://x.com/two"]
 
 
 def test_fetch_failure_returns_empty():
@@ -114,3 +111,62 @@ def test_cross_host_and_unsafe_children_rejected():
     assert "https://x.com/one" in urls
     assert not any("169.254" in u or u.startswith("file:") or "evil.com" in u
                    for u in fetched)
+
+
+def _urlopen_403(req, timeout=None, context=None):
+    from urllib.error import HTTPError
+    raise HTTPError(req.full_url, 403, "Forbidden", {}, None)
+
+
+def test_403_uses_fallback():
+    calls = []
+
+    def fallback(url):
+        calls.append(url)
+        return SITEMAP_PLAIN if url == "https://x.com/sitemap.xml" else None
+    with patch.object(sitemap, "urlopen", _urlopen_403):
+        urls = sitemap._fetch_sitemap_urls("x.com", fallback=fallback)
+    assert urls == ["https://x.com/a", "https://x.com/b"]
+    assert calls == ["https://x.com/sitemap.xml", "https://x.com/sitemap_index.xml"]
+
+
+def test_403_without_fallback_returns_empty():
+    with patch.object(sitemap, "urlopen", _urlopen_403):
+        assert sitemap._fetch_sitemap_urls("x.com") == []
+
+
+def test_200_does_not_use_fallback():
+    def fallback(url):
+        raise AssertionError("fallback used on a 200")
+    with patch.object(sitemap, "urlopen",
+                      _fake_urlopen({"https://x.com/sitemap.xml": SITEMAP_PLAIN})):
+        urls = sitemap._fetch_sitemap_urls("x.com", fallback=fallback)
+    assert urls == ["https://x.com/a", "https://x.com/b"]
+
+
+def test_fallback_respects_size_cap():
+    with patch.object(sitemap, "urlopen", _urlopen_403), \
+         patch.object(sitemap, "_MAX_SITEMAP_BYTES", 10):
+        assert sitemap._fetch_sitemap_urls(
+            "x.com", fallback=lambda u: SITEMAP_PLAIN) == []
+
+
+def test_plain_sitemap_urls_not_fetched_as_child_sitemaps():
+    calls = []
+    opener = _fake_urlopen({"https://x.com/sitemap.xml": SITEMAP_PLAIN})
+
+    def spy(req, timeout=None, context=None):
+        calls.append(req.full_url)
+        return opener(req, timeout, context)
+    with patch.object(sitemap, "urlopen", spy):
+        sitemap._fetch_sitemap_urls("x.com")
+    assert calls == ["https://x.com/sitemap.xml", "https://x.com/sitemap_index.xml"]
+
+
+def test_odd_namespace_index_still_recursed():
+    index = (b'<sitemapindex xmlns="urn:odd"><sitemap><loc>https://x.com/sub1.xml'
+             b'</loc></sitemap></sitemapindex>')
+    with patch.object(sitemap, "urlopen", _fake_urlopen({
+            "https://x.com/sitemap.xml": index,
+            "https://x.com/sub1.xml": SUB1})):
+        assert sitemap._fetch_sitemap_urls("x.com") == ["https://x.com/one"]

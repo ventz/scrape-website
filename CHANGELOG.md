@@ -6,6 +6,28 @@ is `__version__` in `scrape_website/__init__.py` (also `pyproject.toml`); `pytho
 app.py --version` prints it and every crawl logs it at start so output is traceable
 to the code that produced it.
 
+## [0.7.3]
+
+### Fixed
+- **`robots.txt` and `sitemap.xml` now get the same WAF fallback as pages.**
+  Hosts behind Akamai (e.g. hr.harvard.edu) answer every aiohttp/urllib request
+  with `403`. Page fetches already recovered through the `curl_cffi`
+  Chrome-fingerprint fallback, but robots.txt and sitemap discovery did not, so
+  robots.txt was silently not enforced and sitemaps were never seeded. Both now
+  retry a `401`/`403` (and, for robots.txt, a challenge interstitial) through
+  the same `_fetch_via_curl_cffi` path, with the cookie bridge turned off
+  (`cookie_bridge=False`): no cookie replay, no cookie file and no Chrome cookie
+  store reads. Successful responses take the same path as before.
+- **A robots.txt that is still blocked after the fallback logs a WARNING**
+  ("proceeding WITHOUT robots.txt enforcement") instead of a debug line. The
+  crawl still proceeds, as before.
+- **Plain sitemaps no longer re-fetch every page URL as a child sitemap.** The
+  namespace-agnostic fallback in the sitemap parser matched every `<loc>`
+  whatever its parent. So a plain `<urlset>` sent each page URL to the
+  child-sitemap fetcher (an extra, unpaced request per page), and a sitemap
+  index seeded its own child `.xml` URLs as pages. It now only matches `<loc>`
+  elements under the expected parent.
+
 ## [0.7.2]
 
 ### Fixed

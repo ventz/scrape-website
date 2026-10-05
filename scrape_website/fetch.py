@@ -390,19 +390,20 @@ class FetchEngine:
     # ------------------------------------------------------------------
     # curl_cffi browser-impersonation fallback (for 403 / WAF challenges)
     # ------------------------------------------------------------------
-    async def _curl_get(self, url: str) -> tuple | None:
+    async def _curl_get(self, url: str, replay_cookies: bool = True) -> tuple | None:
         """One curl_cffi GET impersonating Chrome, replaying ALL cached cookies for
         this host (Cloudflare/Imperva/Akamai clearance + any login session) with the
         MATCHED User-Agent. Returns a fetch tuple, or None on transport error / missing
         dep. The caller decides if a 403/challenge response is worth escalating to the
-        cookie bridge."""
+        cookie bridge. ``replay_cookies=False`` sends no cookies at all (and never
+        touches the cookie cache/file) — the fingerprint alone."""
         try:
             from curl_cffi.requests import AsyncSession
         except ImportError:
             return None
         # cf_clearance is bound to UA — send the SAME UA the cookies were minted with.
         headers = {'User-Agent': self.user_agent}
-        cookie = CF_SESSION.cookie_header_for(url)
+        cookie = CF_SESSION.cookie_header_for(url) if replay_cookies else None
         if cookie:
             if self.allow_insecure_tls and not self._warned_insecure_cookies:
                 self._warned_insecure_cookies = True
@@ -445,7 +446,8 @@ class FetchEngine:
             return True
         return False
 
-    async def _fetch_via_curl_cffi(self, url: str) -> tuple | None:
+    async def _fetch_via_curl_cffi(self, url: str,
+                                   cookie_bridge: bool = True) -> tuple | None:
         """Real-browser-fingerprint fallback for 403 / WAF / Cloudflare challenges.
 
         aiohttp's TLS/HTTP2 fingerprint is increasingly fingerprint-blocked by WAFs
@@ -455,10 +457,16 @@ class FetchEngine:
         file / live cookie store / a one-time solve in real Chrome under --human — the
         only thing that can mint a Cloudflare Private Access Token) and replay with the
         matched UA. Returns a fetch tuple, or None if nothing helped.
+
+        ``cookie_bridge=False`` stops after the fingerprint-only attempt: no cookie
+        replay, no cookie file / Chrome cookie store reads, no real-Chrome tab. Used
+        for robots.txt and sitemap.xml, which must never trigger cookie reads.
         """
-        result = await self._curl_get(url)
+        result = await self._curl_get(url, replay_cookies=cookie_bridge)
         if not self._curl_blocked(result):
             return result
+        if not cookie_bridge:
+            return None
         # Still blocked. Try to obtain clearance cookies, then replay once.
         # Silent sources (cookies file / live Chrome) always run; opening a real
         # Chrome tab to solve interactively only happens under --human.
@@ -631,23 +639,47 @@ class FetchEngine:
             await self.start()
         parsed = urlparse(base_url)
         robots_url = f"{parsed.scheme or 'https'}://{parsed.netloc}/robots.txt"
+        blocked_status = None
         try:
             from protego import Protego
             async with self.session.get(robots_url, allow_redirects=True) as resp:
+                status = resp.status
                 ctype = resp.headers.get('Content-Type', '').lower()
-                # Some SPA/CMS hosts serve their HTML app shell (status 200) for
-                # a missing /robots.txt — don't parse that as rules.
-                if resp.status == 200 and 'html' not in ctype:
-                    body = await resp.text()
-                    self._robots = Protego.parse(body)
-                    self.logger.info(f"robots.txt loaded from {robots_url}")
-                else:
-                    self.logger.debug(
-                        f"No usable robots.txt at {robots_url} "
-                        f"(status {resp.status}, type {ctype or 'unknown'})")
+                body = await resp.text() if status == 200 else ''
+            # WAF block (403, or a 200 challenge interstitial): retry with the
+            # same Chrome-fingerprint fallback page fetches use, minus the
+            # cookie bridge — robots.txt never triggers cookie reads.
+            if status in (401, 403) or (
+                    status == 200 and 'html' in ctype
+                    and classify_page(body, status)[0] == 'challenge'):
+                blocked_status = status
+                self.logger.info(
+                    f"HTTP {status} for {robots_url} — trying Chrome-fingerprint "
+                    f"fallback (curl_cffi)")
+                fallback = await self._fetch_via_curl_cffi(
+                    robots_url, cookie_bridge=False)
+                if fallback is not None:
+                    content, fctype, _kind, status = fallback
+                    ctype = (fctype or '').lower()
+                    body = (content.decode('utf-8', errors='replace')
+                            if isinstance(content, bytes) else content)
+            # Some SPA/CMS hosts serve their HTML app shell (status 200) for
+            # a missing /robots.txt — don't parse that as rules.
+            if status == 200 and 'html' not in ctype:
+                self._robots = Protego.parse(body)
+                self.logger.info(f"robots.txt loaded from {robots_url}")
+            else:
+                self.logger.debug(
+                    f"No usable robots.txt at {robots_url} "
+                    f"(status {status}, type {ctype or 'unknown'})")
         except Exception as e:
             self.logger.debug(f"Could not load robots.txt ({robots_url}): {e}")
             self._robots = None
+        if blocked_status is not None and self._robots is None:
+            self.logger.warning(
+                f"robots.txt at {robots_url} is blocked (HTTP {blocked_status}) "
+                f"and the curl_cffi fallback did not get it — proceeding WITHOUT "
+                f"robots.txt enforcement")
 
         if self._robots is not None:
             try:

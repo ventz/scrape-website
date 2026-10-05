@@ -2,6 +2,8 @@
 
 import ssl
 import xml.etree.ElementTree as ET
+from typing import Callable
+from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import urlopen, Request
 
@@ -16,7 +18,9 @@ _MAX_SITEMAP_BYTES = 10 * 1024 * 1024
 
 def _fetch_sitemap_urls(host: str, scheme: str = "https",
                         timeout: int | None = None, max_urls: int = 5000,
-                        allow_insecure_tls: bool = False) -> list[str]:
+                        allow_insecure_tls: bool = False,
+                        fallback: Callable[[str], bytes | None] | None = None,
+                        ) -> list[str]:
     """Best-effort sitemap discovery.
 
     Tries ``{scheme}://{host}/sitemap.xml`` then
@@ -25,7 +29,10 @@ def _fetch_sitemap_urls(host: str, scheme: str = "https",
     Returns a deduped list of ``<loc>`` URLs, capped at *max_urls*.
     Any fetch/parse failure returns ``[]``.
 
-    Uses only stdlib (``urllib`` + ``xml.etree``) — no new deps.
+    Uses only stdlib (``urllib`` + ``xml.etree``) — no new deps. When a
+    fetch is refused with HTTP 401/403 (a WAF block), ``fallback(url)`` is
+    called if given and its bytes are used instead (the crawler passes the
+    FetchEngine's curl_cffi fingerprint fallback).
     """
     # Common XML namespace used in sitemaps
     ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
@@ -42,9 +49,15 @@ def _fetch_sitemap_urls(host: str, scheme: str = "https",
             req = Request(url, headers={"User-Agent": CONFIG["user_agent"]})
             with urlopen(req, timeout=timeout, context=ssl_ctx) as resp:
                 data = resp.read(_MAX_SITEMAP_BYTES + 1)
-                return None if len(data) > _MAX_SITEMAP_BYTES else data
+        except HTTPError as e:
+            if fallback is None or e.code not in (401, 403):
+                return None
+            data = fallback(url)
+            if data is None:
+                return None
         except Exception:
             return None
+        return None if len(data) > _MAX_SITEMAP_BYTES else data
 
     def _child_allowed(url: str) -> bool:
         """SSRF gate for sitemap-index children: the child <loc> comes from
@@ -78,12 +91,17 @@ def _fetch_sitemap_urls(host: str, scheme: str = "https",
             for elem in root.findall(f"{tag}/loc"):
                 if elem.text:
                     urls.append(elem.text.strip())
-            # Also try namespace-stripped approach
+            # Also try namespace-stripped approach (any/odd namespace). Only
+            # <loc> under a <{tag}> counts: otherwise a plain <urlset>
+            # parsed for tag="sitemap" yields every page URL, and each page
+            # gets fetched as if it were a child sitemap.
             if not urls:
-                for elem in root.iter():
-                    local = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
-                    if local == "loc" and elem.text:
-                        urls.append(elem.text.strip())
+                for parent in root.iter():
+                    if parent.tag.split("}")[-1] != tag:
+                        continue
+                    for elem in parent:
+                        if elem.tag.split("}")[-1] == "loc" and elem.text:
+                            urls.append(elem.text.strip())
         return urls
 
     seen: set[str] = set()
